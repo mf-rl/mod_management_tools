@@ -41,6 +41,48 @@ Dry run (no file moves):
 python organize_sims4_packages.py "C:\Path\To\Mods" --dry-run
 ```
 
+### `identify_merged_sims4_packages.py`
+
+Scans a mods folder recursively and identifies merged `.package` files.
+
+How it works:
+
+- High confidence: detects package-manifest resource types commonly used by merge tools (`0x7FB6AD8A` and legacy `0x73E93EEB`).
+- Medium confidence (optional): heuristic fallback for probable merged files using very high CASPART count/density patterns.
+
+Usage (high-confidence only):
+
+```bash
+python identify_merged_sims4_packages.py --path "C:\Path\To\Mods"
+```
+
+Include probable heuristic matches:
+
+```bash
+python identify_merged_sims4_packages.py "C:\Path\To\Mods" --include-probable
+```
+
+Unmerge detected merged files:
+
+```bash
+python identify_merged_sims4_packages.py --path "C:\Path\To\Mods" --unmerge
+```
+
+When `--unmerge` is used:
+
+- Script asks if original merged files should be kept or sent to trash.
+- It writes extracted packages into a sibling folder named `<path>_unmerged`.
+- Example: `C:\Tmp\Items` -> `C:\Tmp\Items_unmerged`
+- For special merged files that only contain a manifest marker (no explicit manifest entry map),
+  the script uses a fallback split-by-CASP-instance process and writes an additional `*_shared.package`
+  with leftover shared resources.
+
+JSON output:
+
+```bash
+python identify_merged_sims4_packages.py "C:\Path\To\Mods" --include-probable --json
+```
+
 ### `find_duplicates.py`
 
 Finds duplicate files by content and moves duplicates into a `Duplicated` folder (keeps the first copy found).
