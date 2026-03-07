@@ -253,6 +253,8 @@ ANIMATION_RESOURCE_TYPES = {
     0xBC4A5044,  # Jazz script – animation state machine bytecode
 }
 
+SIM_MODIFIER_TYPE = 0x8B18FF6E  # SimModifier – CAS sliders / body-face modifiers
+
 OVERRIDE_FILENAME_TOKENS = (
     "override",
     "replacement",
@@ -815,6 +817,7 @@ def classify_package(package_path: Path) -> Tuple[str, Optional[str]]:
         has_casp = False
         has_cas_preset = False
         has_animation = False
+        has_sim_modifier = False
 
         for index, entry in enumerate(entries):
             entry_type = entry["type"]
@@ -847,6 +850,9 @@ def classify_package(package_path: Path) -> Tuple[str, Optional[str]]:
             if entry_type in ANIMATION_RESOURCE_TYPES:
                 has_animation = True
 
+            if entry_type == SIM_MODIFIER_TYPE:
+                has_sim_modifier = True
+
         if first_cas_index is not None and (first_build_index is None or first_cas_index <= first_build_index):
             if first_body_type is None:
                 # Some files include tuning resources and are misclassified as CAS by weak markers.
@@ -872,6 +878,9 @@ def classify_package(package_path: Path) -> Tuple[str, Optional[str]]:
 
         if has_animation:
             return "Animation", None
+
+        if has_sim_modifier:
+            return "Slider", None
 
     search_buffers = [raw_data.lower(), raw_data.replace(b"\x00", b"").lower()]
 
@@ -971,6 +980,7 @@ def organize_packages(base_path: Path, output_base: Path, dry_run: bool) -> Dict
         "tuning_moved": 0,
         "preset_moved": 0,
         "animation_moved": 0,
+        "slider_moved": 0,
         "override_moved": 0,
         "unknown_moved": 0,
         "failed_moves": 0,
@@ -1067,6 +1077,19 @@ def organize_packages(base_path: Path, output_base: Path, dry_run: bool) -> Dict
 
             continue
 
+        if package_type == "Slider":
+            target_folder = output_base / "Sliders"
+            moved_to = move_file(package_file, target_folder, dry_run=dry_run)
+
+            if moved_to is None:
+                stats["failed_moves"] += 1
+                print(f"{display_path} - identified as Slider - move failed to Sliders")
+            else:
+                stats["slider_moved"] += 1
+                print(f"{display_path} - identified as Slider - moved to Sliders")
+
+            continue
+
         if package_type == "Override":
             target_folder = output_base / "Overrides"
             moved_to = move_file(package_file, target_folder, dry_run=dry_run)
@@ -1131,6 +1154,7 @@ def main() -> None:
     print(f"Tuning files moved: {stats['tuning_moved']}")
     print(f"Preset files moved: {stats['preset_moved']}")
     print(f"Animation files moved: {stats['animation_moved']}")
+    print(f"Slider files moved: {stats['slider_moved']}")
     print(f"Override files moved: {stats['override_moved']}")
     print(f"Other/unknown files moved: {stats['unknown_moved']}")
     print(f"Failed moves: {stats['failed_moves']}")
