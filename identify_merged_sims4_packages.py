@@ -2,6 +2,7 @@ import argparse
 import ctypes
 import json
 import os
+import shutil
 import struct
 import zlib
 from pathlib import Path
@@ -682,6 +683,27 @@ def send_paths_to_trash(paths: List[Path]) -> List[Path]:
     return failed
 
 
+def move_paths_to_folder(paths: List[Path], destination_folder: Path) -> Tuple[List[Path], List[Tuple[Path, str]]]:
+    destination_folder.mkdir(parents=True, exist_ok=True)
+
+    moved: List[Path] = []
+    failed: List[Tuple[Path, str]] = []
+
+    for source in paths:
+        if not source.exists():
+            failed.append((source, "source does not exist"))
+            continue
+
+        destination = build_unique_destination(destination_folder, source.name)
+        try:
+            shutil.move(str(source), str(destination))
+            moved.append(source)
+        except OSError as exc:
+            failed.append((source, str(exc)))
+
+    return moved, failed
+
+
 def detect_merged_package(
     package_path: Path,
     *,
@@ -850,6 +872,12 @@ def parse_args() -> argparse.Namespace:
         help="Unmerge high-confidence merged packages into a sibling '<path>_unmerged' folder",
     )
     parser.add_argument(
+        "--move",
+        dest="move_path",
+        default=None,
+        help="Move detected merged files to this folder (folder is created if needed)",
+    )
+    parser.add_argument(
         "--json",
         action="store_true",
         help="Print findings as JSON",
@@ -896,6 +924,16 @@ def main() -> None:
         min_caspart_density=args.min_caspart_density,
     )
 
+    detected_merged_paths = [
+        Path(str(finding["path"]))
+        for finding in findings
+        if finding["status"] in {"Merged", "ProbablyMerged"}
+    ]
+
+    move_target: Optional[Path] = None
+    if args.move_path:
+        move_target = Path(args.move_path).expanduser().resolve()
+
     if args.unmerge:
         merged_files = [Path(str(finding["path"])) for finding in findings if finding["status"] == "Merged"]
 
@@ -930,6 +968,12 @@ def main() -> None:
         if delete_originals and processed_files:
             trashed_failures = send_paths_to_trash(processed_files)
 
+        moved_files: List[Path] = []
+        move_failures: List[Tuple[Path, str]] = []
+        if move_target is not None and not delete_originals:
+            move_candidates = [path for path in merged_files if path.exists()]
+            moved_files, move_failures = move_paths_to_folder(move_candidates, move_target)
+
         unmerge_report = {
             "output_folder": str(unmerged_folder),
             "merged_detected": len(merged_files),
@@ -938,6 +982,9 @@ def main() -> None:
             "unmerged_files_created": total_created,
             "delete_originals_requested": delete_originals,
             "trash_delete_failures": len(trashed_failures),
+            "move_target": str(move_target) if move_target is not None else None,
+            "moved_after_unmerge": len(moved_files),
+            "move_failures": len(move_failures),
         }
 
         if args.json:
@@ -950,6 +997,9 @@ def main() -> None:
                         {"path": str(path), "reason": reason} for path, reason in failed_files
                     ],
                     "trash_delete_failures_paths": [str(path) for path in trashed_failures],
+                    "move_failures_details": [
+                        {"path": str(path), "reason": reason} for path, reason in move_failures
+                    ],
                 },
             }
             print(json.dumps(payload, indent=2))
@@ -983,10 +1033,39 @@ def main() -> None:
                         display_path = str(failed_path)
                     print(f"- {display_path}")
 
+        if move_target is not None:
+            if delete_originals:
+                print("Move step skipped because originals were sent to trash.")
+            else:
+                print(f"Merged files moved: {len(moved_files)} -> {move_target}")
+                if move_failures:
+                    print("Failed to move these files:")
+                    for failed_path, reason in move_failures:
+                        try:
+                            display_path = str(failed_path.relative_to(base_path))
+                        except ValueError:
+                            display_path = str(failed_path)
+                        print(f"- {display_path} | reason={reason}")
+
         return
 
+    moved_files: List[Path] = []
+    move_failures: List[Tuple[Path, str]] = []
+    if move_target is not None and detected_merged_paths:
+        moved_files, move_failures = move_paths_to_folder(detected_merged_paths, move_target)
+
     if args.json:
-        print(json.dumps({"findings": findings, "stats": stats}, indent=2))
+        payload: Dict[str, object] = {"findings": findings, "stats": stats}
+        if move_target is not None:
+            payload["move"] = {
+                "target": str(move_target),
+                "moved": len(moved_files),
+                "failed": len(move_failures),
+                "failed_details": [
+                    {"path": str(path), "reason": reason} for path, reason in move_failures
+                ],
+            }
+        print(json.dumps(payload, indent=2))
         return
 
     print(f"Scanning path: {base_path}")
@@ -1002,6 +1081,17 @@ def main() -> None:
             print("No high-confidence merged files found.")
             print("Tip: rerun with --include-probable to show heuristic matches.")
         return
+
+    if move_target is not None:
+        print(f"Merged files moved: {len(moved_files)} -> {move_target}")
+        if move_failures:
+            print("Failed to move these files:")
+            for failed_path, reason in move_failures:
+                try:
+                    display_path = str(failed_path.relative_to(base_path))
+                except ValueError:
+                    display_path = str(failed_path)
+                print(f"- {display_path} | reason={reason}")
 
     print("\nDetected merged packages:")
     for finding in findings:
