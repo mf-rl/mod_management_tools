@@ -1,153 +1,159 @@
 # Sims 4 Mod File Helper Scripts
 
-A small set of Python utilities I use to organize my mod files. These scripts operate directly on your folders, so make a backup before running them.
+A set of Python utilities for organizing Sims 4 `.package` mod files. These scripts operate directly on your folders — **make a backup before running them**.
 
 ## Requirements
 
-- Python 3.9+ (any recent 3.x should work)
+- Python 3.9+
 - Optional: `unidecode` for better transliteration in `rename_non_latin_files.py`
-
-Install optional dependency:
 
 ```bash
 python -m pip install unidecode
 ```
 
+---
+
 ## Scripts
 
 ### `organize_sims4_packages.py`
 
-Scans a mods folder recursively, detects whether `.package` files are CAS or Build/Buy content, and moves them into folders:
+Scans a mods folder recursively, classifies `.package` files by content, and sorts them into categorized folders.
 
-- CAS files: moved into a body-type folder like `Hair`, `Top`, `Shoes`, etc.
-- Build/Buy files: moved into `BuildItem`
-- Unknown metadata: moved into `PossiblyMerged`
+#### Classification & Output Folders
 
-How it works:
+| Category | Output Folder | How Detected |
+|---|---|---|
+| Merged | `Merged/` | Contains a merge-tool manifest resource (`0x7FB6AD8A` or `0x73E93EEB`) |
+| CAS | `<BodyType>/` or `UnknownBodyType/` | Contains CAS resource types (CASP, GEOM, RMAP, SkinTone, StyledLook) |
+| Build/Buy | `BuildItem/` | Contains Build/Buy resource types (COBJ, OBJD, catalogs, walls, floors, etc.) |
+| Tuning | `Tuning/` | Contains tuning resource types or tuning text markers |
+| Preset | `Presets/` | Contains `CASPresetResource` (`0xEAA32ADD`) |
+| Animation | `Animations/` | Contains `ClipResource` (`0x6B20C4F3`) or `Jazz Script` (`0xBC4A5044`) |
+| Override | `Overrides/` | Filename contains "override" or "replacement" |
+| Unknown | `Other/` | Fallback for unclassified files |
 
-- Reads the DBPF index inside `.package` files.
-- Detects CAS vs Build/Buy by resource types and markers.
-- Attempts to detect CAS body type from CASP data, flag tables, or filename text.
+#### CAS Body Type Detection (4-layer cascade)
 
-Usage:
+1. **Adaptive CASP parser** — Reads CASP version, then tries version-specific field layouts to extract the body type ID. Supports all known CASP versions (v27–v50+) via 6 empirically verified layouts.
+2. **Flag table scan** — Scans for a valid CAS flag category table and reads body type from a fixed offset after the table.
+3. **ID frequency scan** — Counts known body type integers across the entire resource as a last-resort heuristic.
+4. **Filename fallback** — Matches over 90 filename tokens (e.g., "top", "hair", "shoes", "dress", "choker") to canonical body type names via `BODY_TYPE_ALIASES`.
+
+Between layers 3 and 4, explicit text marker scans also run (`body type:` patterns in raw data).
+
+#### Body Types (59 total, IDs 0x00–0x3A)
+
+Hat, Hair, Head, Face, FullBody, Top, Bottom, Shoes, Accessories, Earrings, Glasses, Necklace, Gloves, Bracelets, Lip/Nose/Brow Rings, Finger Rings, FacialHair, Lipstick, Eyeshadow, Eyeliner, Blush, Facepaint, Eyebrows, Eyecolor, Socks, Eyelashes, ForeheadCrease, Freckles, Dimples, Tights, Moles, Tattoos (8 zones), MouthCrease, SkinOverlay.
+
+#### Filename Aliases (90+ mappings)
+
+Common variants are mapped to canonical names: `choker`→Necklace, `suit`/`dress`/`jumpsuit`/`romper`→FullBody, `lipliner`→Lipstick, `freckle`→Freckles, `cheek`→Blush, `facemask`/`nosemask`→FacePaint, `eyelid`→Eyeshadow, `beard`/`mustache`→FacialHair, `boot`/`slipper`→Shoes, `hoodie`/`sweater`/`jacket`→Top, and many more.
+
+#### Usage
 
 ```bash
 python organize_sims4_packages.py "C:\Path\To\Mods"
-```
-
-Dry run (no file moves):
-
-```bash
 python organize_sims4_packages.py "C:\Path\To\Mods" --dry-run
 ```
 
+Output goes to `<input_path>_Organized/`.
+
+---
+
 ### `identify_merged_sims4_packages.py`
 
-Scans a mods folder recursively and identifies merged `.package` files.
+Scans a mods folder recursively to identify and optionally unmerge merged `.package` files.
 
-How it works:
+#### Detection Methods
 
-- High confidence: detects package-manifest resource types commonly used by merge tools (`0x7FB6AD8A` and legacy `0x73E93EEB`).
-- Medium confidence (optional): heuristic fallback for probable merged files using very high CASPART count/density patterns.
+- **High confidence** — Detects merge-tool manifest resource types (`0x7FB6AD8A`, `0x73E93EEB`). Parses manifest entry count via multiple layout strategies.
+- **Heuristic (optional)** — TSR filename patterns, high CASP count (>200), or secondary CASP count + density thresholds.
 
-Usage (high-confidence only):
+#### Unmerge Capability
+
+Reconstructs individual `.package` files from a merged DBPF:
+
+- Reads manifest entries (filenames + TGI resource lists).
+- Maps resources by TGI key with swapped-instance fallback.
+- Builds valid DBPF files for each extracted package.
+- For empty-manifest merges: splits by CASP instance ID + writes a shared resources package.
+- Interactive prompt to keep or trash original merged files.
+
+#### Usage
 
 ```bash
+# Scan only
 python identify_merged_sims4_packages.py --path "C:\Path\To\Mods"
-```
 
-Include probable heuristic matches:
-
-```bash
+# Include heuristic matches
 python identify_merged_sims4_packages.py "C:\Path\To\Mods" --include-probable
-```
 
-Unmerge detected merged files:
+# Move merged files
+python identify_merged_sims4_packages.py --path "C:\Path\To\Mods" --move "C:\Path\To\MergedArchive"
 
-```bash
+# Unmerge into individual packages
 python identify_merged_sims4_packages.py --path "C:\Path\To\Mods" --unmerge
+
+# JSON output
+python identify_merged_sims4_packages.py "C:\Path\To\Mods" --json
 ```
 
-When `--unmerge` is used:
-
-- Script asks if original merged files should be kept or sent to trash.
-- It writes extracted packages into a sibling folder named `<path>_unmerged`.
-- Example: `C:\Tmp\Items` -> `C:\Tmp\Items_unmerged`
-- For special merged files that only contain a manifest marker (no explicit manifest entry map),
-  the script uses a fallback split-by-CASP-instance process and writes an additional `*_shared.package`
-  with leftover shared resources.
-
-JSON output:
-
-```bash
-python identify_merged_sims4_packages.py "C:\Path\To\Mods" --include-probable --json
-```
+---
 
 ### `find_duplicates.py`
 
-Finds duplicate files by content and moves duplicates into a `Duplicated` folder (keeps the first copy found).
+Finds duplicate files by content (SHA-256) and moves duplicates into a `Duplicated` folder.
 
-How it works:
-
-- Groups by file size to reduce hashing.
-- Hashes file contents with SHA-256 to confirm duplicates.
-- Moves duplicates into `Duplicated`, with unique filenames when needed.
-
-Usage:
+- Groups files by size first to minimize hashing work.
+- Keeps the first copy found, moves subsequent duplicates.
+- Collision-safe filenames (`_1`, `_2`, etc.).
 
 ```bash
 python find_duplicates.py "C:\Path\To\Mods"
 ```
 
+---
+
 ### `organize_files_by_author.py`
 
-Groups files by common filename prefixes and moves them into subfolders (useful when creators prefix their files with a consistent tag).
+Groups files by shared filename prefixes into subfolders. Useful when mod creators use consistent naming prefixes.
 
-How it works:
-
-- Normalizes filenames (alphanumeric only, lowercased) for matching.
-- Builds prefix frequency counts across files.
-- Creates folders for prefixes that meet a minimum group size.
-- Moves files into the most suitable prefix folder, or `Unknown` if no strong match.
-
-Usage:
+- Normalizes filenames (alphanumeric, lowercased) for matching.
+- Scores prefixes by `(group_size × 1000) + length`.
+- Windows-safe folder names (strips reserved characters and names).
+- Unmatched files go to `Unknown/`.
 
 ```bash
 python organize_files_by_author.py "C:\Path\To\Mods"
-```
-
-Optional tuning:
-
-```bash
 python organize_files_by_author.py "C:\Path\To\Mods" --min-group-size 3 --min-prefix-length 5 --max-prefix-length 30
 ```
+
+---
 
 ### `rename_non_latin_files.py`
 
 Renames files containing non-ASCII characters to ASCII equivalents.
 
-How it works:
-
-- Uses `unidecode` when available for transliteration.
-- Falls back to Unicode normalization.
-- Uses numeric code points when no transliteration is possible.
-- Ensures unique filenames to avoid collisions.
-
-Usage:
+- 3-tier transliteration: `unidecode` → Unicode NFKD decomposition → `ord()` code points.
+- Collision-safe renaming.
+- Works without `unidecode` installed (graceful fallback).
 
 ```bash
 python rename_non_latin_files.py "C:\Path\To\Mods"
 ```
 
+---
+
 ## Notes and Safety
 
-- These scripts move or rename files in place. Make a backup of your mods folder before running them.
+- These scripts move or rename files. **Back up your mods folder first.**
 - All scripts recurse into subfolders.
-- If a move or rename fails (permissions, locked files), the script reports it and continues.
+- Failed moves/renames are reported and skipped.
 
 ## Suggested Workflow
 
-1. `rename_non_latin_files.py` (avoid filename issues)
-2. `find_duplicates.py` (clean duplicates)
-3. `organize_sims4_packages.py` (sort by CAS/Build/Buy)
-4. `organize_files_by_author.py` (optional, for creator prefixes)
+1. `rename_non_latin_files.py` — fix filename encoding issues
+2. `find_duplicates.py` — remove duplicate content
+3. `identify_merged_sims4_packages.py --unmerge` — split merged packages
+4. `organize_sims4_packages.py` — sort by content type and body type
+5. `organize_files_by_author.py` — (optional) group by creator prefix
