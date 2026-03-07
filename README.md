@@ -100,6 +100,44 @@ python identify_merged_sims4_packages.py "C:\Path\To\Mods" --json
 
 ---
 
+### `merge_sims4_packages.py`
+
+Merges individual `.package` files within subfolders into combined DBPF packages with a manifest.
+
+#### Merge Rules
+
+- **Max 300 files** per merged package.
+- **Max 900 MB** per merged package.
+- If both limits are satisfied in a single batch → one merged file.
+- If limits are exceeded → multiple numbered merged files.
+
+#### Output Naming
+
+| Scenario | Output |
+|---|---|
+| Single batch | `FolderName_Merged.package` |
+| Multiple batches | `FolderName_Merged_01.package`, `FolderName_Merged_02.package`, … |
+
+#### How It Works
+
+- Scans all immediate subfolders in the given path.
+- Reads each `.package` file, extracts all DBPF resources (preserving original compression).
+- Batches files by count and total size.
+- Builds a merged DBPF with a manifest resource (`0x7FB6AD8A`) mapping each original filename to its resource TGIs.
+- After merging, prompts to send original files to the recycle bin.
+
+#### Usage
+
+```bash
+# Preview what would be merged
+python merge_sims4_packages.py "C:\Path\To\Mods" --dry-run
+
+# Merge packages
+python merge_sims4_packages.py "C:\Path\To\Mods"
+```
+
+---
+
 ### `find_duplicates.py`
 
 Finds duplicate files by content (SHA-256) and moves duplicates into a `Duplicated` folder.
@@ -157,3 +195,4 @@ python rename_non_latin_files.py "C:\Path\To\Mods"
 3. `identify_merged_sims4_packages.py --unmerge` — split merged packages
 4. `organize_sims4_packages.py` — sort by content type and body type
 5. `organize_files_by_author.py` — (optional) group by creator prefix
+6. `merge_sims4_packages.py` — (optional) re-merge organized folders for faster game loading
