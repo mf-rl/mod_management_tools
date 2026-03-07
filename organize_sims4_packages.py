@@ -24,6 +24,16 @@ BUILD_BUY_MARKERS = (
     b"catalog",
 )
 
+TUNING_MARKERS = (
+    b"snippet_tuning",
+    b"interaction_tuning",
+    b"object_tuning",
+    b"trait_tuning",
+    b"situation_tuning",
+    b"buff_tuning",
+    b"statistic_tuning",
+)
+
 BODY_TYPE_ALIASES: Dict[str, str] = {
     "accessory": "Accessories",
     "accessories": "Accessories",
@@ -37,12 +47,18 @@ BODY_TYPE_ALIASES: Dict[str, str] = {
     "hats": "Hat",
     "earring": "Earrings",
     "earrings": "Earrings",
+    "choker": "Necklace",
     "necklace": "Necklace",
     "necklaces": "Necklace",
+    "pendant": "Necklace",
     "ring": "Rings",
     "rings": "Rings",
     "bracelet": "Bracelet",
     "bracelets": "Bracelet",
+    "glass": "Glasses",
+    "glasses": "Glasses",
+    "sunglasses": "Glasses",
+    "spectacles": "Glasses",
     "glove": "Gloves",
     "gloves": "Gloves",
     "sock": "Socks",
@@ -71,10 +87,19 @@ BODY_TYPE_ALIASES: Dict[str, str] = {
     "jackets": "Top",
     "bottom": "Bottom",
     "bottoms": "Bottom",
+    "body": "FullBody",
     "fullbody": "FullBody",
     "full body": "FullBody",
     "outfit": "FullBody",
     "outfits": "FullBody",
+    "suit": "FullBody",
+    "suits": "FullBody",
+    "dress": "FullBody",
+    "dresses": "FullBody",
+    "jumpsuit": "FullBody",
+    "jumpsuits": "FullBody",
+    "romper": "FullBody",
+    "rompers": "FullBody",
     "hair": "Hair",
     "hairstyle": "Hair",
     "eyebrow": "Eyebrows",
@@ -85,12 +110,30 @@ BODY_TYPE_ALIASES: Dict[str, str] = {
     "moustache": "FacialHair",
     "eyeliner": "Eyeliner",
     "eyeshadow": "Eyeshadow",
+    "eye shadow": "Eyeshadow",
+    "eyelid": "Eyeshadow",
+    "eyelids": "Eyeshadow",
+    "eyelash": "Eyelashes",
+    "eyelashes": "Eyelashes",
+    "lash": "Eyelashes",
+    "lashes": "Eyelashes",
+    "mascara": "Eyelashes",
     "blush": "Blush",
+    "cheek": "Blush",
+    "cheeks": "Blush",
     "lipstick": "Lipstick",
+    "lipliner": "Lipstick",
+    "lip liner": "Lipstick",
     "facepaint": "FacePaint",
     "face paint": "FacePaint",
+    "facemask": "FacePaint",
+    "face mask": "FacePaint",
+    "nosemask": "FacePaint",
+    "nose mask": "FacePaint",
     "tattoo": "Tattoo",
     "tattoos": "Tattoo",
+    "freckle": "Freckles",
+    "freckles": "Freckles",
     "skin detail": "SkinDetails",
     "skindetail": "SkinDetails",
 }
@@ -101,7 +144,7 @@ BODY_TYPE_BY_ID: Dict[int, str] = {
     0x02: "Hair",
     0x03: "Head",
     0x04: "Face",
-    0x05: "Body",
+    0x05: "FullBody",
     0x06: "Top",
     0x07: "Bottom",
     0x08: "Shoes",
@@ -133,7 +176,7 @@ BODY_TYPE_BY_ID: Dict[int, str] = {
     0x22: "Eyebrows",
     0x23: "Eyecolor",
     0x24: "Socks",
-    0x25: "Mascara",
+    0x25: "Eyelashes",
     0x26: "ForeheadCrease",
     0x27: "Freckles",
     0x28: "DimpleLeft",
@@ -185,7 +228,35 @@ BUILD_BUY_RESOURCE_TYPES = {
     0x1D6DF1CF,  # Column
 }
 
+TUNING_RESOURCE_TYPES = {
+    0x03B33DDF,  # Tuning / TuningMarkup
+    0xE882D22F,  # InteractionTuning
+    0xB61DE6B4,  # ObjectTuning
+    0x7DF2169C,  # SnippetTuning
+    0xCB5FDDC7,  # TraitTuning
+    0x6017E896,  # BuffTuning
+    0x339BC5BD,  # StatisticTuning
+    0xFBC3AEEB,  # SituationTuning
+    0x62E94D38,  # CombinedTuning (binary)
+}
+
+MERGED_MANIFEST_TYPES = {
+    0x7FB6AD8A,  # modern package manifest used by merge/unmerge tools
+    0x73E93EEB,  # legacy package manifest type
+}
+
 CASP_RESOURCE_TYPE = 0x034AEECB
+CAS_PRESET_TYPE = 0xEAA32ADD  # CASPresetResource – identifies CAS preset packages
+
+ANIMATION_RESOURCE_TYPES = {
+    0x6B20C4F3,  # ClipResource – animation clips
+    0xBC4A5044,  # Jazz script – animation state machine bytecode
+}
+
+OVERRIDE_FILENAME_TOKENS = (
+    "override",
+    "replacement",
+)
 
 CAS_FLAG_CATEGORY_TO_BODY_TYPE: Dict[int, str] = {
     0x004D: "Hair",
@@ -198,6 +269,17 @@ CAS_FLAG_CATEGORY_TO_BODY_TYPE: Dict[int, str] = {
     0x0054: "Shoes",
     0x005C: "Accessories",
 }
+
+# Candidate CASP header layouts ordered by version range.
+# Each tuple: (min_version, max_version, pre_flags_size, per_flag_size, post_flags_size)
+_CASP_LAYOUTS = [
+    (50, 999, 54, 6, 17),
+    (41,  49, 40, 6, 17),
+    (38,  40, 32, 6, 13),
+    (37,  37, 31, 6, 13),
+    (36,  36, 31, 4, 13),
+    ( 0,  35, 27, 4, 13),
+]
 
 
 def read_uint32(data: bytes, offset: int) -> Optional[int]:
@@ -342,6 +424,53 @@ def read_resource_payload(data: bytes, entry: Dict[str, int]) -> Optional[bytes]
     return None
 
 
+def _try_casp_layout(
+    data: bytes,
+    name_end: int,
+    pre_flags_size: int,
+    per_flag_size: int,
+    post_flags_size: int,
+) -> Optional[str]:
+    """Try a specific CASP layout and return the body type if it validates."""
+    fc_offset = name_end + pre_flags_size
+    if fc_offset + 4 > len(data):
+        return None
+
+    flag_count = struct.unpack_from("<I", data, fc_offset)[0]
+    if flag_count > 256:
+        return None
+
+    entries_start = fc_offset + 4
+    flags_end = entries_start + flag_count * per_flag_size
+    bt_offset = flags_end + post_flags_size
+    if bt_offset + 4 > len(data):
+        return None
+
+    body_type_value = struct.unpack_from("<i", data, bt_offset)[0]
+    if body_type_value < 0:
+        return None
+
+    bt_name = BODY_TYPE_BY_ID.get(body_type_value)
+    if bt_name is None or bt_name == "All":
+        return None
+
+    # Validate: check flag category values are in the expected CAS range.
+    if flag_count > 0:
+        valid = 0
+        check = min(flag_count, 5)
+        for i in range(check):
+            cat_off = entries_start + i * per_flag_size
+            if cat_off + 2 > len(data):
+                break
+            cat = struct.unpack_from("<H", data, cat_off)[0]
+            if 0x0040 <= cat <= 0x0070:
+                valid += 1
+        if valid < max(1, check // 2):
+            return None
+
+    return bt_name
+
+
 def extract_casp_body_type_from_resource(resource_data: bytes) -> Optional[str]:
     if len(resource_data) < 20:
         return None
@@ -369,45 +498,28 @@ def extract_casp_body_type_from_resource(resource_data: bytes) -> Optional[str]:
         return None
     cursor += name_length
 
-    fixed_prefix = 4 + 2 + 4 + 4 + 1 + 8
-    if cursor + fixed_prefix > len(resource_data):
-        return None
-    cursor += fixed_prefix
-
-    if version >= 36:
-        if cursor + 8 > len(resource_data):
-            return None
-        cursor += 8
+    # Build candidate layouts ordered by likelihood for this version.
+    # Each tuple: (pre_flags_size, per_flag_size, post_flags_size)
+    # Empirically verified across versions v27-v51.
+    if version >= 50:
+        candidates = [(54, 6, 17), (40, 6, 17)]
+    elif version >= 41:
+        candidates = [(40, 6, 17)]
+    elif version >= 38:
+        candidates = [(32, 6, 13), (40, 6, 17), (31, 6, 13)]
+    elif version >= 37:
+        candidates = [(31, 6, 13), (32, 6, 13)]
+    elif version >= 36:
+        candidates = [(31, 4, 13), (27, 4, 13)]
     else:
-        if cursor + 4 > len(resource_data):
-            return None
-        cursor += 4
+        candidates = [(27, 4, 13)]
 
-    flag_count = read_uint32(resource_data, cursor)
-    if flag_count is None:
-        return None
-    cursor += 4
+    for pfs, pfl, post_fs in candidates:
+        result = _try_casp_layout(resource_data, cursor, pfs, pfl, post_fs)
+        if result is not None:
+            return result
 
-    per_flag_size = 6 if version >= 37 else 4
-    flags_byte_size = flag_count * per_flag_size
-    if cursor + flags_byte_size > len(resource_data):
-        return None
-    cursor += flags_byte_size
-
-    if cursor + 4 + 4 + 4 + 1 + 4 > len(resource_data):
-        return None
-
-    # deprecatedPrice, partTitleKey, partDescriptionKey, uniqueTextureSpace
-    cursor += 4 + 4 + 4 + 1
-    body_type_value = struct.unpack_from("<i", resource_data, cursor)[0]
-
-    if body_type_value < 0:
-        return None
-
-    parsed = BODY_TYPE_BY_ID.get(body_type_value)
-    if parsed == "All":
-        return None
-    return parsed
+    return None
 
 
 def extract_casp_body_type_from_flag_table(resource_data: bytes) -> Optional[str]:
@@ -462,6 +574,39 @@ def extract_casp_body_type_from_flag_table(resource_data: bytes) -> Optional[str
             best_body_type = candidate
 
     return best_body_type
+
+
+# Body-type IDs whose integer values are common in binary data and produce
+# false positives when scanning aligned int32 values (e.g. 0x20 = space).
+_NOISY_BODY_TYPE_IDS = {0x20}
+
+
+def extract_casp_body_type_from_id_frequency(resource_data: bytes) -> Optional[str]:
+    # Last-resort heuristic for CASP variants where known structured offsets are not stable.
+    counts: Dict[str, int] = {}
+
+    # Start at offset 4 to skip the CASP version field (e.g. version 43 = 0x2B
+    # which would falsely match MoleLeftLip).
+    for offset in range(4, len(resource_data) - 3, 4):
+        value = struct.unpack_from("<i", resource_data, offset)[0]
+        if value < 0 or value in _NOISY_BODY_TYPE_IDS:
+            continue
+
+        body_type = BODY_TYPE_BY_ID.get(value)
+        if body_type is None or body_type == "All":
+            continue
+
+        counts[body_type] = counts.get(body_type, 0) + 1
+
+    if not counts:
+        return None
+
+    ranked = sorted(counts.items(), key=lambda item: item[1], reverse=True)
+    top_body_type, top_count = ranked[0]
+    if top_count < 2:
+        return None
+
+    return top_body_type
 
 
 def to_searchable_text(data: bytes) -> str:
@@ -579,6 +724,53 @@ def detect_first_body_type(data: bytes) -> Optional[str]:
     return None
 
 
+def detect_body_type_from_explicit_markers(data: bytes) -> Optional[str]:
+    search_spaces = [
+        data.decode("latin-1", errors="ignore").lower(),
+        to_searchable_text(data),
+    ]
+
+    patterns = (
+        r"body\s*type\s*[:=\-]?\s*([a-z][a-z\s/_-]{1,40})",
+        r"bodytype\s*[:=\-]?\s*([a-z][a-z\s/_-]{1,40})",
+    )
+
+    best_match: Optional[Tuple[int, str]] = None
+    for lowered in search_spaces:
+        for pattern in patterns:
+            for match in re.finditer(pattern, lowered):
+                candidate = normalize_body_type(match.group(1))
+                if candidate is None:
+                    continue
+
+                offset = match.start()
+                if best_match is None or offset < best_match[0]:
+                    best_match = (offset, candidate)
+
+        marker_spans = (
+            r"body\s*type\s*[:=\-]?\s*([^\r\n]{1,80})",
+            r"bodytype\s*[:=\-]?\s*([^\r\n]{1,80})",
+        )
+        for span_pattern in marker_spans:
+            for match in re.finditer(span_pattern, lowered):
+                snippet = match.group(1)
+                words = re.findall(r"[a-z][a-z ]{1,40}", snippet)
+                for word in words:
+                    candidate = normalize_body_type(word)
+                    if candidate is None:
+                        continue
+
+                    offset = match.start()
+                    if best_match is None or offset < best_match[0]:
+                        best_match = (offset, candidate)
+                    break
+
+    if best_match is not None:
+        return best_match[1]
+
+    return None
+
+
 def detect_body_type_from_filename(package_path: Path) -> Optional[str]:
     stem = package_path.stem.lower()
     normalized = re.sub(r"[^a-z0-9 ]+", " ", stem).strip()
@@ -612,9 +804,17 @@ def classify_package(package_path: Path) -> Tuple[str, Optional[str]]:
 
     entries = parse_dbpf_entries(raw_data)
     if entries:
+        has_merged_manifest = any(entry["type"] in MERGED_MANIFEST_TYPES for entry in entries)
+        if has_merged_manifest:
+            return "Merged", None
+
         first_cas_index: Optional[int] = None
         first_build_index: Optional[int] = None
+        first_tuning_index: Optional[int] = None
         first_body_type: Optional[str] = None
+        has_casp = False
+        has_cas_preset = False
+        has_animation = False
 
         for index, entry in enumerate(entries):
             entry_type = entry["type"]
@@ -624,22 +824,54 @@ def classify_package(package_path: Path) -> Tuple[str, Optional[str]]:
             if first_build_index is None and entry_type in BUILD_BUY_RESOURCE_TYPES:
                 first_build_index = index
 
+            if first_tuning_index is None and entry_type in TUNING_RESOURCE_TYPES:
+                first_tuning_index = index
+
             if first_body_type is None and entry_type == CASP_RESOURCE_TYPE:
+                has_casp = True
                 payload = read_resource_payload(raw_data, entry)
                 if payload is not None:
                     first_body_type = extract_casp_body_type_from_resource(payload)
                     if first_body_type is None:
                         first_body_type = extract_casp_body_type_from_flag_table(payload)
                     if first_body_type is None:
+                        first_body_type = extract_casp_body_type_from_id_frequency(payload)
+                    if first_body_type is None:
                         first_body_type = detect_first_body_type(payload)
+            elif entry_type == CASP_RESOURCE_TYPE:
+                has_casp = True
+
+            if entry_type == CAS_PRESET_TYPE:
+                has_cas_preset = True
+
+            if entry_type in ANIMATION_RESOURCE_TYPES:
+                has_animation = True
 
         if first_cas_index is not None and (first_build_index is None or first_cas_index <= first_build_index):
             if first_body_type is None:
-                first_body_type = detect_body_type_from_filename(package_path)
+                # Some files include tuning resources and are misclassified as CAS by weak markers.
+                if first_tuning_index is not None and not has_casp:
+                    return "Tuning", None
+
+                # Fallback to full-package marker scan before filename heuristics.
+                first_body_type = detect_body_type_from_explicit_markers(raw_data)
+                if first_body_type is None:
+                    first_body_type = detect_body_type_from_filename(package_path)
             return "CAS", first_body_type
 
         if first_build_index is not None:
             return "BuildBuy", None
+
+        if first_tuning_index is not None:
+            if has_animation:
+                return "Animation", None
+            return "Tuning", None
+
+        if has_cas_preset:
+            return "Preset", None
+
+        if has_animation:
+            return "Animation", None
 
     search_buffers = [raw_data.lower(), raw_data.replace(b"\x00", b"").lower()]
 
@@ -659,13 +891,36 @@ def classify_package(package_path: Path) -> Tuple[str, Optional[str]]:
     build_buy_offset = min(build_buy_offsets) if build_buy_offsets else None
 
     if cas_offset is None and build_buy_offset is None:
+        tuning_candidates = [
+            find_first_marker_offset(buffer_data, TUNING_MARKERS)
+            for buffer_data in search_buffers
+        ]
+        tuning_offsets = [offset for offset in tuning_candidates if offset is not None]
+        if tuning_offsets:
+            return "Tuning", None
+        if _is_override_filename(package_path):
+            return "Override", None
         return "Unknown", None
 
     if cas_offset is not None and (build_buy_offset is None or cas_offset <= build_buy_offset):
         body_type = detect_first_body_type(raw_data)
         return "CAS", body_type
 
+    tuning_candidates = [
+        find_first_marker_offset(buffer_data, TUNING_MARKERS)
+        for buffer_data in search_buffers
+    ]
+    tuning_offsets = [offset for offset in tuning_candidates if offset is not None]
+    tuning_offset = min(tuning_offsets) if tuning_offsets else None
+    if tuning_offset is not None and (build_buy_offset is None or tuning_offset < build_buy_offset):
+        return "Tuning", None
+
     return "BuildBuy", None
+
+
+def _is_override_filename(package_path: Path) -> bool:
+    name_lower = package_path.stem.lower()
+    return any(token in name_lower for token in OVERRIDE_FILENAME_TOKENS)
 
 
 def build_unique_destination(target_folder: Path, file_name: str) -> Path:
@@ -685,7 +940,7 @@ def build_unique_destination(target_folder: Path, file_name: str) -> Path:
 
 
 def move_file(source: Path, destination_folder: Path, dry_run: bool) -> Optional[Path]:
-    destination_folder.mkdir(exist_ok=True)
+    destination_folder.mkdir(parents=True, exist_ok=True)
     destination = build_unique_destination(destination_folder, source.name)
 
     if source.resolve() == destination.resolve():
@@ -706,12 +961,17 @@ def list_package_files(base_path: Path) -> List[Path]:
     return [path for path in base_path.rglob("*") if path.is_file() and path.suffix.lower() == ".package"]
 
 
-def organize_packages(base_path: Path, dry_run: bool) -> Dict[str, int]:
+def organize_packages(base_path: Path, output_base: Path, dry_run: bool) -> Dict[str, int]:
     stats = {
         "total": 0,
+        "merged_moved": 0,
         "cas_moved": 0,
         "cas_unknown_body_type": 0,
         "buildbuy_moved": 0,
+        "tuning_moved": 0,
+        "preset_moved": 0,
+        "animation_moved": 0,
+        "override_moved": 0,
         "unknown_moved": 0,
         "failed_moves": 0,
     }
@@ -726,11 +986,24 @@ def organize_packages(base_path: Path, dry_run: bool) -> Dict[str, int]:
             display_path = str(package_file)
 
         package_type, body_type = classify_package(package_file)
+        if package_type == "Merged":
+            target_folder = output_base / "Merged"
+            moved_to = move_file(package_file, target_folder, dry_run=dry_run)
+
+            if moved_to is None:
+                stats["failed_moves"] += 1
+                print(f"{display_path} - identified as Merged - move failed to Merged")
+            else:
+                stats["merged_moved"] += 1
+                print(f"{display_path} - identified as Merged - moved to Merged")
+
+            continue
+
         if package_type == "CAS":
             target_name = body_type or "UnknownBodyType"
             if body_type is None:
                 stats["cas_unknown_body_type"] += 1
-            target_folder = base_path / target_name
+            target_folder = output_base / target_name
             moved_to = move_file(package_file, target_folder, dry_run=dry_run)
 
             if moved_to is None:
@@ -743,7 +1016,7 @@ def organize_packages(base_path: Path, dry_run: bool) -> Dict[str, int]:
             continue
 
         if package_type == "BuildBuy":
-            target_folder = base_path / "BuildItem"
+            target_folder = output_base / "BuildItem"
             moved_to = move_file(package_file, target_folder, dry_run=dry_run)
 
             if moved_to is None:
@@ -755,15 +1028,67 @@ def organize_packages(base_path: Path, dry_run: bool) -> Dict[str, int]:
 
             continue
 
-        target_folder = base_path / "PossiblyMerged"
+        if package_type == "Tuning":
+            target_folder = output_base / "Tuning"
+            moved_to = move_file(package_file, target_folder, dry_run=dry_run)
+
+            if moved_to is None:
+                stats["failed_moves"] += 1
+                print(f"{display_path} - identified as Tuning - move failed to Tuning")
+            else:
+                stats["tuning_moved"] += 1
+                print(f"{display_path} - identified as Tuning - moved to Tuning")
+
+            continue
+
+        if package_type == "Preset":
+            target_folder = output_base / "Presets"
+            moved_to = move_file(package_file, target_folder, dry_run=dry_run)
+
+            if moved_to is None:
+                stats["failed_moves"] += 1
+                print(f"{display_path} - identified as Preset - move failed to Presets")
+            else:
+                stats["preset_moved"] += 1
+                print(f"{display_path} - identified as Preset - moved to Presets")
+
+            continue
+
+        if package_type == "Animation":
+            target_folder = output_base / "Animations"
+            moved_to = move_file(package_file, target_folder, dry_run=dry_run)
+
+            if moved_to is None:
+                stats["failed_moves"] += 1
+                print(f"{display_path} - identified as Animation - move failed to Animations")
+            else:
+                stats["animation_moved"] += 1
+                print(f"{display_path} - identified as Animation - moved to Animations")
+
+            continue
+
+        if package_type == "Override":
+            target_folder = output_base / "Overrides"
+            moved_to = move_file(package_file, target_folder, dry_run=dry_run)
+
+            if moved_to is None:
+                stats["failed_moves"] += 1
+                print(f"{display_path} - identified as Override - move failed to Overrides")
+            else:
+                stats["override_moved"] += 1
+                print(f"{display_path} - identified as Override - moved to Overrides")
+
+            continue
+
+        target_folder = output_base / "Other"
         moved_to = move_file(package_file, target_folder, dry_run=dry_run)
 
         if moved_to is None:
             stats["failed_moves"] += 1
-            print(f"{display_path} - identified as Unknown - move failed to PossiblyMerged")
+            print(f"{display_path} - identified as Unknown - move failed to Other")
         else:
             stats["unknown_moved"] += 1
-            print(f"{display_path} - identified as Unknown - moved to PossiblyMerged")
+            print(f"{display_path} - identified as Unknown - moved to Other")
 
     return stats
 
@@ -787,20 +1112,27 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     base_path = Path(args.path).expanduser().resolve()
+    output_base = base_path.parent / f"{base_path.name}_Organized"
 
     if not base_path.exists() or not base_path.is_dir():
         print(f"Invalid directory: {base_path}")
         raise SystemExit(1)
 
-    stats = organize_packages(base_path, dry_run=args.dry_run)
+    stats = organize_packages(base_path, output_base, dry_run=args.dry_run)
 
     mode = "DRY RUN" if args.dry_run else "APPLY"
     print(f"Scan finished. Mode: {mode}")
+    print(f"Output base folder: {output_base}")
     print(f"Total .package files scanned: {stats['total']}")
+    print(f"Merged files moved: {stats['merged_moved']}")
     print(f"CAS files moved: {stats['cas_moved']}")
     print(f"CAS files with unknown body type: {stats['cas_unknown_body_type']}")
     print(f"Build/Buy files moved: {stats['buildbuy_moved']}")
-    print(f"Unknown metadata moved to PossiblyMerged: {stats['unknown_moved']}")
+    print(f"Tuning files moved: {stats['tuning_moved']}")
+    print(f"Preset files moved: {stats['preset_moved']}")
+    print(f"Animation files moved: {stats['animation_moved']}")
+    print(f"Override files moved: {stats['override_moved']}")
+    print(f"Other/unknown files moved: {stats['unknown_moved']}")
     print(f"Failed moves: {stats['failed_moves']}")
 
 
