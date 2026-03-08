@@ -10,6 +10,7 @@ from typing import Dict, List, Optional, Set, Tuple
 
 
 CASP_RESOURCE_TYPE = 0x034AEECB
+CAS_PRESET_TYPE = 0xEAA32ADD  # CASPresetResource
 MERGED_MANIFEST_TYPES = {
     0x7FB6AD8A,  # modern package manifest used by merge/unmerge tooling
     0x73E93EEB,  # legacy package manifest type
@@ -715,11 +716,14 @@ def detect_merged_package(
         "path": str(package_path),
         "status": "NotMerged",
         "confidence": "none",
+        "detection_mode": "none",
         "reason": "no merged indicators found",
         "manifest_type": None,
         "manifest_entry_count": None,
         "casp_count": 0,
         "resource_count": 0,
+        "unique_type_count": 0,
+        "casp_density": 0.0,
     }
 
     try:
@@ -737,9 +741,17 @@ def detect_merged_package(
         return result
 
     result["resource_count"] = len(entries)
+    type_counts: Dict[int, int] = {}
+    for entry in entries:
+        entry_type = int(entry["type"])
+        type_counts[entry_type] = type_counts.get(entry_type, 0) + 1
+    result["unique_type_count"] = len(type_counts)
 
     casp_count = sum(1 for entry in entries if entry["type"] == CASP_RESOURCE_TYPE)
+    has_cas_preset = any(entry["type"] == CAS_PRESET_TYPE for entry in entries)
     result["casp_count"] = casp_count
+    casp_density = (casp_count / len(entries)) if entries else 0.0
+    result["casp_density"] = round(casp_density, 4)
 
     for entry in entries:
         entry_type = entry["type"]
@@ -751,6 +763,7 @@ def detect_merged_package(
 
         result["status"] = "Merged"
         result["confidence"] = "high"
+        result["detection_mode"] = "manifest"
         result["manifest_type"] = f"0x{entry_type:08X}"
         result["manifest_entry_count"] = entry_count
 
@@ -764,18 +777,33 @@ def detect_merged_package(
             )
         return result
 
-    casp_density = (casp_count / len(entries)) if entries else 0.0
     file_name_lower = package_path.name.lower()
+
+    # Legacy/manual merged packages often have no manifest marker but still show
+    # a very strong CASPART-heavy profile in a narrow set of resource types.
+    # We treat these as high-confidence merged for detection purposes only.
+    if casp_count >= 200 and casp_density >= 0.25 and len(type_counts) <= 10 and not has_cas_preset:
+        result["status"] = "Merged"
+        result["confidence"] = "high"
+        result["detection_mode"] = "legacy-heuristic"
+        result["reason"] = (
+            "strong legacy merged heuristic: "
+            f"CASPART count ({casp_count}), density ({casp_density:.2f}), "
+            f"resource type variety ({len(type_counts)})"
+        )
+        return result
 
     if "tsrlibrary" in file_name_lower or "tsr_library" in file_name_lower:
         result["status"] = "ProbablyMerged"
         result["confidence"] = "medium"
+        result["detection_mode"] = "filename-heuristic"
         result["reason"] = "filename suggests TSR library/merged package"
         return result
 
     if casp_count > min_casparts_primary:
         result["status"] = "ProbablyMerged"
         result["confidence"] = "medium"
+        result["detection_mode"] = "count-heuristic"
         result["reason"] = (
             f"very high CASPART count ({casp_count}) in one package"
         )
@@ -784,6 +812,7 @@ def detect_merged_package(
     if casp_count > min_casparts_secondary and casp_density > min_caspart_density:
         result["status"] = "ProbablyMerged"
         result["confidence"] = "medium"
+        result["detection_mode"] = "count-density-heuristic"
         result["reason"] = (
             f"high CASPART count ({casp_count}) and density ({casp_density:.2f})"
         )
@@ -935,7 +964,11 @@ def main() -> None:
         move_target = Path(args.move_path).expanduser().resolve()
 
     if args.unmerge:
-        merged_files = [Path(str(finding["path"])) for finding in findings if finding["status"] == "Merged"]
+        merged_files = [
+            Path(str(finding["path"]))
+            for finding in findings
+            if finding["status"] == "Merged" and finding.get("detection_mode") == "manifest"
+        ]
 
         if not merged_files:
             if args.json:

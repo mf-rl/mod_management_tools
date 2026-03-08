@@ -245,6 +245,24 @@ MERGED_MANIFEST_TYPES = {
     0x73E93EEB,  # legacy package manifest type
 }
 
+# Strong fallback for legacy/manual merged CAS packages without a manifest resource.
+LEGACY_MERGED_MIN_CASPART_COUNT = 200
+LEGACY_MERGED_MIN_CASPART_DENSITY = 0.25
+LEGACY_MERGED_MAX_RESOURCE_TYPES = 10
+
+MERGED_FILENAME_HINTS = (
+    "tsrlibrary",
+    "tsr_library",
+    "merged",
+)
+
+MERGED_FOLDER_HINTS = (
+    "posmerged",
+    "mergedsure",
+    "tsrlibrary",
+    "tsr_library",
+)
+
 CASP_RESOURCE_TYPE = 0x034AEECB
 CAS_PRESET_TYPE = 0xEAA32ADD  # CASPresetResource – identifies CAS preset packages
 
@@ -810,6 +828,9 @@ def classify_package(package_path: Path) -> Tuple[str, Optional[str]]:
         if has_merged_manifest:
             return "Merged", None
 
+        type_counts: Dict[int, int] = {}
+        casp_count = 0
+
         first_cas_index: Optional[int] = None
         first_build_index: Optional[int] = None
         first_tuning_index: Optional[int] = None
@@ -821,6 +842,10 @@ def classify_package(package_path: Path) -> Tuple[str, Optional[str]]:
 
         for index, entry in enumerate(entries):
             entry_type = entry["type"]
+            type_counts[entry_type] = type_counts.get(entry_type, 0) + 1
+            if entry_type == CASP_RESOURCE_TYPE:
+                casp_count += 1
+
             if first_cas_index is None and entry_type in CAS_RESOURCE_TYPES:
                 first_cas_index = index
 
@@ -852,6 +877,15 @@ def classify_package(package_path: Path) -> Tuple[str, Optional[str]]:
 
             if entry_type == SIM_MODIFIER_TYPE:
                 has_sim_modifier = True
+
+        casp_density = (casp_count / len(entries)) if entries else 0.0
+        if (
+            casp_count >= LEGACY_MERGED_MIN_CASPART_COUNT
+            and casp_density >= LEGACY_MERGED_MIN_CASPART_DENSITY
+            and len(type_counts) <= LEGACY_MERGED_MAX_RESOURCE_TYPES
+            and not has_cas_preset
+        ):
+            return "Merged", None
 
         if first_cas_index is not None and (first_build_index is None or first_cas_index <= first_build_index):
             if first_body_type is None:
@@ -927,6 +961,50 @@ def classify_package(package_path: Path) -> Tuple[str, Optional[str]]:
     return "BuildBuy", None
 
 
+def detect_merged_status(package_path: Path) -> str:
+    """Return merged detection status: Merged, ProbablyMerged, NotMerged, or Unreadable."""
+    # Only treat strong folder hints as merged. Avoid generic "Merged" folder names,
+    # which are often used for manual sorting and can contain non-merged packages.
+    for parent in package_path.parents:
+        parent_name = parent.name.lower()
+        if any(token in parent_name for token in MERGED_FOLDER_HINTS):
+            return "Merged"
+
+    try:
+        raw_data = package_path.read_bytes()
+    except OSError:
+        return "Unreadable"
+
+    entries = parse_dbpf_entries(raw_data)
+    if not entries:
+        return "Unreadable"
+
+    if any(entry["type"] in MERGED_MANIFEST_TYPES for entry in entries):
+        return "Merged"
+
+    casp_count = sum(1 for entry in entries if entry["type"] == CASP_RESOURCE_TYPE)
+    has_cas_preset = any(entry["type"] == CAS_PRESET_TYPE for entry in entries)
+    casp_density = (casp_count / len(entries)) if entries else 0.0
+    unique_type_count = len({int(entry["type"]) for entry in entries})
+
+    if (
+        casp_count >= LEGACY_MERGED_MIN_CASPART_COUNT
+        and casp_density >= LEGACY_MERGED_MIN_CASPART_DENSITY
+        and unique_type_count <= LEGACY_MERGED_MAX_RESOURCE_TYPES
+        and not has_cas_preset
+    ):
+        return "Merged"
+
+    name_lower = package_path.name.lower()
+    if any(token in name_lower for token in MERGED_FILENAME_HINTS):
+        return "ProbablyMerged"
+
+    if casp_count > LEGACY_MERGED_MIN_CASPART_COUNT:
+        return "ProbablyMerged"
+
+    return "NotMerged"
+
+
 def _is_override_filename(package_path: Path) -> bool:
     name_lower = package_path.stem.lower()
     return any(token in name_lower for token in OVERRIDE_FILENAME_TOKENS)
@@ -974,6 +1052,7 @@ def organize_packages(base_path: Path, output_base: Path, dry_run: bool) -> Dict
     stats = {
         "total": 0,
         "merged_moved": 0,
+        "probable_merged_moved": 0,
         "cas_moved": 0,
         "cas_unknown_body_type": 0,
         "buildbuy_moved": 0,
@@ -994,6 +1073,33 @@ def organize_packages(base_path: Path, output_base: Path, dry_run: bool) -> Dict
             display_path = str(package_file.relative_to(base_path))
         except ValueError:
             display_path = str(package_file)
+
+        merged_status = detect_merged_status(package_file)
+        if merged_status == "Merged":
+            target_folder = output_base / "Merged"
+            moved_to = move_file(package_file, target_folder, dry_run=dry_run)
+
+            if moved_to is None:
+                stats["failed_moves"] += 1
+                print(f"{display_path} - identified as Merged - move failed to Merged")
+            else:
+                stats["merged_moved"] += 1
+                print(f"{display_path} - identified as Merged - moved to Merged")
+
+            continue
+
+        if merged_status == "ProbablyMerged":
+            target_folder = output_base / "ProbableMerged"
+            moved_to = move_file(package_file, target_folder, dry_run=dry_run)
+
+            if moved_to is None:
+                stats["failed_moves"] += 1
+                print(f"{display_path} - identified as ProbablyMerged - move failed to ProbableMerged")
+            else:
+                stats["probable_merged_moved"] += 1
+                print(f"{display_path} - identified as ProbablyMerged - moved to ProbableMerged")
+
+            continue
 
         package_type, body_type = classify_package(package_file)
         if package_type == "Merged":
@@ -1148,6 +1254,7 @@ def main() -> None:
     print(f"Output base folder: {output_base}")
     print(f"Total .package files scanned: {stats['total']}")
     print(f"Merged files moved: {stats['merged_moved']}")
+    print(f"Probable merged files moved: {stats['probable_merged_moved']}")
     print(f"CAS files moved: {stats['cas_moved']}")
     print(f"CAS files with unknown body type: {stats['cas_unknown_body_type']}")
     print(f"Build/Buy files moved: {stats['buildbuy_moved']}")
