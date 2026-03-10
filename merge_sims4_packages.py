@@ -133,12 +133,15 @@ def parse_dbpf_entries(data: bytes) -> List[Dict[str, int]]:
     return entries
 
 
-def read_resource_blob(data: bytes, entry: Dict[str, int]) -> Optional[bytes]:
-    offset = entry["offset"]
-    compressed_size = entry["compressed_size"]
-    if compressed_size <= 0 or offset < 0 or offset + compressed_size > len(data):
-        return None
-    return data[offset : offset + compressed_size]
+def get_valid_entries(entries: List[Dict[str, int]], data_len: int) -> List[Dict[str, int]]:
+    valid: List[Dict[str, int]] = []
+    for entry in entries:
+        offset = entry["offset"]
+        compressed_size = entry["compressed_size"]
+        if compressed_size <= 0 or offset < 0 or offset + compressed_size > data_len:
+            continue
+        valid.append(entry)
+    return valid
 
 
 # ---------------------------------------------------------------------------
@@ -177,74 +180,109 @@ def build_manifest_blob(file_entries: List[Dict]) -> bytes:
     return b"".join(parts)
 
 
-def build_dbpf_package(resources: List[Dict]) -> bytes:
+def write_merged_dbpf_package(batch: List[Dict], output_path: Path) -> bool:
+    """Write merged DBPF package directly to disk to keep memory use low."""
     header_size = 96
-    index_flags = 0
-    index_size = 4 + (len(resources) * 32)
-    data_start = header_size
-    index_offset = data_start + sum(len(resource["blob"]) for resource in resources)
 
-    output = bytearray(index_offset + index_size)
-    output[0:4] = b"DBPF"
-
-    struct.pack_into("<I", output, 4, 2)   # major version
-    struct.pack_into("<I", output, 8, 1)   # minor version
-    struct.pack_into("<I", output, 32, 0)  # unused
-    struct.pack_into("<I", output, 36, len(resources))  # index entry count
-    struct.pack_into("<I", output, 40, 0)  # short index offset (0 = use long)
-    struct.pack_into("<I", output, 44, index_size)
-    struct.pack_into("<I", output, 60, 3)  # index version
-    struct.pack_into("<Q", output, 64, index_offset)
-
-    cursor = data_start
+    manifest_blob = build_manifest_blob([{"name": pkg["name"], "tgis": pkg["tgis"]} for pkg in batch])
     indexed_resources: List[Dict[str, int]] = []
-    for resource in resources:
-        blob = resource["blob"]
-        size = len(blob)
-        output[cursor : cursor + size] = blob
-        indexed_resources.append(
-            {
-                "type": int(resource["type"]),
-                "group": int(resource["group"]),
-                "instance_hi": int(resource["instance_hi"]),
-                "instance_lo": int(resource["instance_lo"]),
-                "offset": cursor,
-                "compressed_size": size,
-                "uncompressed_size": int(resource["uncompressed_size"]),
-                "compression_type": int(resource["compression_type"]),
-                "compression_flags": int(resource.get("compression_flags", 0)),
-            }
-        )
-        cursor += size
 
-    struct.pack_into("<I", output, index_offset, index_flags)
-    cursor = index_offset + 4
-    for resource in indexed_resources:
-        struct.pack_into("<I", output, cursor, resource["type"])
-        struct.pack_into("<I", output, cursor + 4, resource["group"])
-        struct.pack_into("<I", output, cursor + 8, resource["instance_hi"])
-        struct.pack_into("<I", output, cursor + 12, resource["instance_lo"])
-        struct.pack_into("<I", output, cursor + 16, resource["offset"])
-        size_and_flag = resource["compressed_size"] | 0x80000000
-        struct.pack_into("<I", output, cursor + 20, size_and_flag)
-        struct.pack_into("<I", output, cursor + 24, resource["uncompressed_size"])
-        cursor += 28
-        struct.pack_into("<H", output, cursor, resource["compression_type"])
-        struct.pack_into("<H", output, cursor + 2, resource["compression_flags"])
-        cursor += 4
+    try:
+        with output_path.open("wb") as out:
+            out.write(b"\x00" * header_size)
+            cursor = header_size
 
-    return bytes(output)
+            # Manifest is the first resource in merged packages.
+            out.write(manifest_blob)
+            indexed_resources.append(
+                {
+                    "type": MERGED_MANIFEST_TYPE,
+                    "group": 0,
+                    "instance_hi": 0,
+                    "instance_lo": 0,
+                    "offset": cursor,
+                    "compressed_size": len(manifest_blob),
+                    "uncompressed_size": len(manifest_blob),
+                    "compression_type": 0x0000,
+                    "compression_flags": 0x0000,
+                }
+            )
+            cursor += len(manifest_blob)
+
+            for pkg in batch:
+                raw_data = pkg["source_path"].read_bytes()
+                entries = parse_dbpf_entries(raw_data)
+                valid_entries = get_valid_entries(entries, len(raw_data))
+
+                if not valid_entries:
+                    raise ValueError(f"No resources found in {pkg['source_path'].name} during merge")
+
+                for entry in valid_entries:
+                    start = entry["offset"]
+                    end = start + entry["compressed_size"]
+                    blob = raw_data[start:end]
+                    out.write(blob)
+                    indexed_resources.append(
+                        {
+                            "type": int(entry["type"]),
+                            "group": int(entry["group"]),
+                            "instance_hi": int(entry["instance_hi"]),
+                            "instance_lo": int(entry["instance_lo"]),
+                            "offset": cursor,
+                            "compressed_size": len(blob),
+                            "uncompressed_size": int(entry["uncompressed_size"]),
+                            "compression_type": int(entry["compression_type"]),
+                            "compression_flags": int(entry.get("compression_flags", 0)),
+                        }
+                    )
+                    cursor += len(blob)
+
+            index_offset = cursor
+            out.write(struct.pack("<I", 0))
+            for resource in indexed_resources:
+                out.write(
+                    struct.pack(
+                        "<IIIIIIIHH",
+                        resource["type"],
+                        resource["group"],
+                        resource["instance_hi"],
+                        resource["instance_lo"],
+                        resource["offset"],
+                        resource["compressed_size"] | 0x80000000,
+                        resource["uncompressed_size"],
+                        resource["compression_type"],
+                        resource["compression_flags"],
+                    )
+                )
+
+            index_size = 4 + (len(indexed_resources) * 32)
+
+            header = bytearray(header_size)
+            header[0:4] = b"DBPF"
+            struct.pack_into("<I", header, 4, 2)   # major version
+            struct.pack_into("<I", header, 8, 1)   # minor version
+            struct.pack_into("<I", header, 32, 0)  # unused
+            struct.pack_into("<I", header, 36, len(indexed_resources))
+            struct.pack_into("<I", header, 40, 0)  # short index offset (0 = use long)
+            struct.pack_into("<I", header, 44, index_size)
+            struct.pack_into("<I", header, 60, 3)  # index version
+            struct.pack_into("<Q", header, 64, index_offset)
+
+            out.seek(0)
+            out.write(header)
+        return True
+    except (OSError, ValueError) as exc:
+        print(f"    ERROR: Failed to write {output_path.name}: {exc}")
+        return False
 
 
 # ---------------------------------------------------------------------------
-# Package loading
+# Package inspection
 # ---------------------------------------------------------------------------
 
 
-def load_package_resources(
-    file_path: Path,
-) -> Optional[Dict]:
-    """Read a .package file and return its filename, resources, and total blob size."""
+def inspect_package(file_path: Path) -> Optional[Dict]:
+    """Read a .package file and return lightweight metadata for batching and manifest."""
     try:
         raw_data = file_path.read_bytes()
     except OSError as exc:
@@ -256,34 +294,22 @@ def load_package_resources(
         print(f"  WARNING: Invalid DBPF in {file_path.name}, skipping")
         return None
 
-    resources: List[Dict] = []
-    total_blob_size = 0
-
-    for entry in entries:
-        blob = read_resource_blob(raw_data, entry)
-        if blob is None:
-            continue
-        resources.append(
-            {
-                "type": entry["type"],
-                "group": entry["group"],
-                "instance_hi": entry["instance_hi"],
-                "instance_lo": entry["instance_lo"],
-                "blob": blob,
-                "compression_type": entry["compression_type"],
-                "compression_flags": entry["compression_flags"],
-                "uncompressed_size": entry["uncompressed_size"],
-            }
-        )
-        total_blob_size += len(blob)
-
-    if not resources:
+    valid_entries = get_valid_entries(entries, len(raw_data))
+    if not valid_entries:
         print(f"  WARNING: No resources found in {file_path.name}, skipping")
         return None
 
+    tgis: List[Tuple[int, int, int, int]] = []
+    total_blob_size = 0
+    for entry in valid_entries:
+        tgis.append((entry["type"], entry["group"], entry["instance_hi"], entry["instance_lo"]))
+        total_blob_size += entry["compressed_size"]
+
     return {
         "name": file_path.name,
-        "resources": resources,
+        "source_path": file_path,
+        "tgis": tgis,
+        "resource_count": len(valid_entries),
         "total_blob_size": total_blob_size,
     }
 
@@ -324,35 +350,6 @@ def create_batches(
 # ---------------------------------------------------------------------------
 
 
-def merge_batch(batch: List[Dict]) -> bytes:
-    """Merge a batch of loaded packages into a single DBPF with manifest."""
-    all_resources: List[Dict] = []
-    manifest_entries: List[Dict] = []
-
-    for pkg in batch:
-        tgis: List[Tuple[int, int, int, int]] = []
-        for res in pkg["resources"]:
-            tgis.append((res["type"], res["group"], res["instance_hi"], res["instance_lo"]))
-            all_resources.append(res)
-        manifest_entries.append({"name": pkg["name"], "tgis": tgis})
-
-    # Build manifest resource and prepend it
-    manifest_blob = build_manifest_blob(manifest_entries)
-    manifest_resource = {
-        "type": MERGED_MANIFEST_TYPE,
-        "group": 0,
-        "instance_hi": 0,
-        "instance_lo": 0,
-        "blob": manifest_blob,
-        "compression_type": 0x0000,
-        "compression_flags": 0x0000,
-        "uncompressed_size": len(manifest_blob),
-    }
-    all_resources.insert(0, manifest_resource)
-
-    return build_dbpf_package(all_resources)
-
-
 def process_folder(
     folder_path: Path, dry_run: bool = False
 ) -> Tuple[Dict[str, int], List[Path]]:
@@ -373,22 +370,21 @@ def process_folder(
     print(f"\n  Folder: {folder_name}")
     print(f"    Found {len(package_files)} .package file(s)")
 
-    # Load all packages, remembering their source paths
-    loaded_packages: List[Dict] = []
+    # Inspect all packages with lightweight metadata only
+    inspected_packages: List[Dict] = []
     for pkg_file in package_files:
-        pkg_data = load_package_resources(pkg_file)
-        if pkg_data is None:
+        pkg_info = inspect_package(pkg_file)
+        if pkg_info is None:
             stats["files_skipped"] += 1
             continue
-        pkg_data["source_path"] = pkg_file
-        loaded_packages.append(pkg_data)
+        inspected_packages.append(pkg_info)
 
-    if not loaded_packages:
+    if not inspected_packages:
         print("    No valid packages to merge")
         return stats, merged_source_files
 
     # Create batches
-    batches = create_batches(loaded_packages)
+    batches = create_batches(inspected_packages)
     use_numbering = len(batches) > 1
 
     print(f"    Merging into {len(batches)} file(s)")
@@ -412,11 +408,7 @@ def process_folder(
             stats["merges_written"] += 1
             continue
 
-        merged_data = merge_batch(batch)
-        try:
-            merged_path.write_bytes(merged_data)
-        except OSError as exc:
-            print(f"    ERROR: Failed to write {merged_name}: {exc}")
+        if not write_merged_dbpf_package(batch, merged_path):
             continue
 
         stats["files_merged"] += file_count
@@ -460,8 +452,55 @@ def _send_path_to_trash_windows(path: Path) -> bool:
     return result == 0 and not operation.fAnyOperationsAborted
 
 
+def _send_paths_to_trash_windows_batched(paths: List[Path], chunk_size: int = 200) -> List[Path]:
+    """Send files to recycle bin in batches to avoid Explorer/UI thrash."""
+    if not paths:
+        return []
+
+    class SHFILEOPSTRUCTW(ctypes.Structure):
+        _fields_ = [
+            ("hwnd", ctypes.c_void_p),
+            ("wFunc", ctypes.c_uint),
+            ("pFrom", ctypes.c_wchar_p),
+            ("pTo", ctypes.c_wchar_p),
+            ("fFlags", ctypes.c_ushort),
+            ("fAnyOperationsAborted", ctypes.c_bool),
+            ("hNameMappings", ctypes.c_void_p),
+            ("lpszProgressTitle", ctypes.c_wchar_p),
+        ]
+
+    FO_DELETE = 3
+    FOF_SILENT = 0x0004
+    FOF_NOCONFIRMATION = 0x0010
+    FOF_ALLOWUNDO = 0x0040
+    FOF_NOERRORUI = 0x0400
+
+    failed: List[Path] = []
+
+    for index in range(0, len(paths), chunk_size):
+        chunk = paths[index : index + chunk_size]
+        operation = SHFILEOPSTRUCTW()
+        operation.wFunc = FO_DELETE
+        operation.pFrom = "\0".join(str(path) for path in chunk) + "\0\0"
+        operation.fFlags = FOF_ALLOWUNDO | FOF_NOCONFIRMATION | FOF_NOERRORUI | FOF_SILENT
+
+        result = ctypes.windll.shell32.SHFileOperationW(ctypes.byref(operation))
+        if result == 0 and not operation.fAnyOperationsAborted:
+            continue
+
+        # If batch fails, retry per-file to isolate failed paths.
+        for path in chunk:
+            if not _send_path_to_trash_windows(path):
+                failed.append(path)
+
+    return failed
+
+
 def send_paths_to_trash(paths: List[Path]) -> List[Path]:
     failed: List[Path] = []
+
+    if os.name == "nt":
+        return _send_paths_to_trash_windows_batched(paths)
 
     try:
         from send2trash import send2trash
@@ -474,12 +513,6 @@ def send_paths_to_trash(paths: List[Path]) -> List[Path]:
         return failed
     except ImportError:
         pass
-
-    if os.name == "nt":
-        for path in paths:
-            if not _send_path_to_trash_windows(path):
-                failed.append(path)
-        return failed
 
     failed.extend(paths)
     return failed

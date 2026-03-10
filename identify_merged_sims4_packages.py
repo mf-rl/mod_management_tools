@@ -557,6 +557,57 @@ def unmerge_package_file(package_path: Path, output_folder: Path) -> Tuple[List[
     return created_paths, "ok"
 
 
+def unmerge_without_manifest(package_path: Path, output_folder: Path) -> Tuple[List[Path], str]:
+    """Heuristic unmerge path for packages without a parseable manifest resource."""
+    try:
+        raw_data = package_path.read_bytes()
+    except OSError as exc:
+        return [], f"read failed: {exc}"
+
+    entries = parse_dbpf_entries(raw_data)
+    if not entries:
+        return [], "invalid DBPF"
+
+    resource_map: Dict[TGI, Dict[str, object]] = {}
+    for entry in entries:
+        if entry["type"] in MERGED_MANIFEST_TYPES:
+            continue
+
+        blob = read_resource_blob(raw_data, entry)
+        if blob is None:
+            continue
+
+        key: TGI = (
+            int(entry["type"]),
+            int(entry["group"]),
+            int(entry["instance_hi"]),
+            int(entry["instance_lo"]),
+        )
+        resource_map[key] = {
+            "type": key[0],
+            "group": key[1],
+            "instance_hi": key[2],
+            "instance_lo": key[3],
+            "blob": blob,
+            "compression_type": int(entry["compression_type"]),
+            "compression_flags": int(entry.get("compression_flags", 0)),
+            "uncompressed_size": int(entry["uncompressed_size"]),
+        }
+
+    if not resource_map:
+        return [], "no resources available for heuristic unmerge"
+
+    created_paths, status = unmerge_empty_manifest_by_casp_instance(
+        package_path,
+        output_folder,
+        resource_map,
+    )
+    if not created_paths:
+        return [], status
+
+    return created_paths, f"ok (heuristic/no-manifest path) | {status}"
+
+
 def unmerge_empty_manifest_by_casp_instance(
     package_path: Path,
     output_folder: Path,
@@ -659,8 +710,55 @@ def send_path_to_trash_windows(path: Path) -> bool:
     return result == 0 and not operation.fAnyOperationsAborted
 
 
+def send_paths_to_trash_windows_batched(paths: List[Path], chunk_size: int = 200) -> List[Path]:
+    """Send files to recycle bin in batches to reduce Explorer blocking on large sets."""
+    if not paths:
+        return []
+
+    class SHFILEOPSTRUCTW(ctypes.Structure):
+        _fields_ = [
+            ("hwnd", ctypes.c_void_p),
+            ("wFunc", ctypes.c_uint),
+            ("pFrom", ctypes.c_wchar_p),
+            ("pTo", ctypes.c_wchar_p),
+            ("fFlags", ctypes.c_ushort),
+            ("fAnyOperationsAborted", ctypes.c_bool),
+            ("hNameMappings", ctypes.c_void_p),
+            ("lpszProgressTitle", ctypes.c_wchar_p),
+        ]
+
+    FO_DELETE = 3
+    FOF_SILENT = 0x0004
+    FOF_NOCONFIRMATION = 0x0010
+    FOF_ALLOWUNDO = 0x0040
+    FOF_NOERRORUI = 0x0400
+
+    failed: List[Path] = []
+
+    for index in range(0, len(paths), chunk_size):
+        chunk = paths[index : index + chunk_size]
+        operation = SHFILEOPSTRUCTW()
+        operation.wFunc = FO_DELETE
+        operation.pFrom = "\0".join(str(path) for path in chunk) + "\0\0"
+        operation.fFlags = FOF_ALLOWUNDO | FOF_NOCONFIRMATION | FOF_NOERRORUI | FOF_SILENT
+
+        result = ctypes.windll.shell32.SHFileOperationW(ctypes.byref(operation))
+        if result == 0 and not operation.fAnyOperationsAborted:
+            continue
+
+        # Fall back to single-file calls only when a batch fails.
+        for path in chunk:
+            if not send_path_to_trash_windows(path):
+                failed.append(path)
+
+    return failed
+
+
 def send_paths_to_trash(paths: List[Path]) -> List[Path]:
     failed: List[Path] = []
+
+    if os.name == "nt":
+        return send_paths_to_trash_windows_batched(paths)
 
     try:
         from send2trash import send2trash
@@ -673,12 +771,6 @@ def send_paths_to_trash(paths: List[Path]) -> List[Path]:
         return failed
     except ImportError:
         pass
-
-    if os.name == "nt":
-        for path in paths:
-            if not send_path_to_trash_windows(path):
-                failed.append(path)
-        return failed
 
     failed.extend(paths)
     return failed
@@ -964,11 +1056,16 @@ def main() -> None:
         move_target = Path(args.move_path).expanduser().resolve()
 
     if args.unmerge:
-        merged_files = [
-            Path(str(finding["path"]))
-            for finding in findings
-            if finding["status"] == "Merged" and finding.get("detection_mode") == "manifest"
-        ]
+        if args.include_probable:
+            unmerge_candidates = [
+                finding for finding in findings if finding["status"] in {"Merged", "ProbablyMerged"}
+            ]
+        else:
+            unmerge_candidates = [
+                finding for finding in findings if finding["status"] == "Merged"
+            ]
+
+        merged_files = [Path(str(finding["path"])) for finding in unmerge_candidates]
 
         if not merged_files:
             if args.json:
@@ -976,7 +1073,10 @@ def main() -> None:
                 return
 
             print(f"Scanning path: {base_path}")
-            print("No high-confidence merged files found to unmerge.")
+            if args.include_probable:
+                print("No merged/probable merged files found to unmerge.")
+            else:
+                print("No high-confidence merged files found to unmerge.")
             return
 
         delete_originals = prompt_delete_originals()
@@ -988,8 +1088,15 @@ def main() -> None:
         failed_files: List[Tuple[Path, str]] = []
         total_created = 0
 
-        for merged_file in merged_files:
-            created_paths, status_text = unmerge_package_file(merged_file, unmerged_folder)
+        for candidate in unmerge_candidates:
+            merged_file = Path(str(candidate["path"]))
+            detection_mode = str(candidate.get("detection_mode", "none"))
+
+            if detection_mode == "manifest":
+                created_paths, status_text = unmerge_package_file(merged_file, unmerged_folder)
+            else:
+                created_paths, status_text = unmerge_without_manifest(merged_file, unmerged_folder)
+
             if not created_paths:
                 failed_files.append((merged_file, status_text))
                 continue
