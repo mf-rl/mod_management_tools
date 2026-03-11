@@ -351,13 +351,23 @@ def create_batches(
 
 
 def process_folder(
-    folder_path: Path, dry_run: bool = False
+    folder_path: Path,
+    output_folder: Path,
+    dry_run: bool = False,
+    delete_after_merge: bool = False,
 ) -> Tuple[Dict[str, int], List[Path]]:
     """Process a single folder: load packages, batch, merge, write output.
 
     Returns a tuple of (stats dict, list of original source file paths that were merged).
     """
-    stats = {"files_found": 0, "files_merged": 0, "files_skipped": 0, "merges_written": 0}
+    stats = {
+        "files_found": 0,
+        "files_merged": 0,
+        "files_skipped": 0,
+        "merges_written": 0,
+        "files_deleted": 0,
+        "files_delete_failed": 0,
+    }
     merged_source_files: List[Path] = []
 
     package_files = sorted(folder_path.glob("*.package"))
@@ -398,7 +408,7 @@ def process_folder(
         else:
             merged_name = f"{folder_name}_Merged.package"
 
-        merged_path = folder_path / merged_name
+        merged_path = output_folder / merged_name
 
         size_mb = total_blob_size / (1024 * 1024)
         print(f"    -> {merged_name} ({file_count} files, {size_mb:.1f} MB)")
@@ -413,6 +423,16 @@ def process_folder(
 
         stats["files_merged"] += file_count
         stats["merges_written"] += 1
+
+        if delete_after_merge:
+            batch_paths = [pkg["source_path"] for pkg in batch]
+            failed = send_paths_to_trash(batch_paths)
+            deleted = len(batch_paths) - len(failed)
+            stats["files_deleted"] += deleted
+            stats["files_delete_failed"] += len(failed)
+            for failed_path in failed:
+                print(f"      WARNING: Could not trash {failed_path.name}")
+
         for pkg in batch:
             merged_source_files.append(pkg["source_path"])
 
@@ -540,7 +560,19 @@ def main() -> None:
         print(f"No subfolders found in '{args.path}'")
         sys.exit(0)
 
+    delete_after_merge = False
+    if not args.dry_run:
+        answer = input(
+            "Delete original unmerged files as each merged file is created (send to trash)? [y/N]: "
+        ).strip().lower()
+        delete_after_merge = answer == "y"
+
+    merged_output_folder = root_path.parent / f"{root_path.name}_Merged"
+    if not args.dry_run:
+        merged_output_folder.mkdir(parents=True, exist_ok=True)
+
     print(f"Scanning {len(subfolders)} subfolder(s) in: {root_path}")
+    print(f"Merged output folder: {merged_output_folder}")
     if args.dry_run:
         print("(DRY RUN - no files will be written)")
 
@@ -550,16 +582,28 @@ def main() -> None:
         "files_merged": 0,
         "files_skipped": 0,
         "merges_written": 0,
+        "files_deleted": 0,
+        "files_delete_failed": 0,
     }
-    all_merged_source_files: List[Path] = []
 
     for folder in subfolders:
-        folder_stats, source_files = process_folder(folder, dry_run=args.dry_run)
+        folder_stats, _source_files = process_folder(
+            folder,
+            merged_output_folder,
+            dry_run=args.dry_run,
+            delete_after_merge=delete_after_merge,
+        )
         if folder_stats["files_found"] > 0:
             total_stats["folders_processed"] += 1
-            for key in ("files_found", "files_merged", "files_skipped", "merges_written"):
+            for key in (
+                "files_found",
+                "files_merged",
+                "files_skipped",
+                "merges_written",
+                "files_deleted",
+                "files_delete_failed",
+            ):
                 total_stats[key] += folder_stats[key]
-            all_merged_source_files.extend(source_files)
 
     print("\n" + "=" * 60)
     print("Summary:")
@@ -568,20 +612,12 @@ def main() -> None:
     print(f"  Files merged      : {total_stats['files_merged']}")
     print(f"  Files skipped     : {total_stats['files_skipped']}")
     print(f"  Merged files out  : {total_stats['merges_written']}")
-
-    # Offer to send original source files to trash
-    if all_merged_source_files and not args.dry_run:
-        answer = input(
-            "\nDelete original unmerged files (send to trash)? [y/N]: "
-        ).strip().lower()
-        if answer == "y":
-            failed = send_paths_to_trash(all_merged_source_files)
-            deleted = len(all_merged_source_files) - len(failed)
-            for f in failed:
-                print(f"  WARNING: Could not trash {f.name}")
-            print(f"  Sent {deleted} original file(s) to trash" + (f", {len(failed)} failed" if failed else ""))
-        else:
-            print("  Original files kept.")
+    if delete_after_merge and not args.dry_run:
+        print(f"  Originals trashed : {total_stats['files_deleted']}")
+        if total_stats["files_delete_failed"] > 0:
+            print(f"  Trash failures    : {total_stats['files_delete_failed']}")
+    elif not args.dry_run:
+        print("  Original files kept.")
 
 
 if __name__ == "__main__":
