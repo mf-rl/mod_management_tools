@@ -1,6 +1,6 @@
 # Sims 4 Mod File Helper Scripts
 
-A set of Python utilities for organizing Sims 4 `.package` mod files. These scripts operate directly on your folders — **make a backup before running them**.
+A set of Python utilities for downloading and organizing Sims 4 `.package` mod files. Most scripts operate directly on your folders — **make a backup before running them**.
 
 ## Requirements
 
@@ -138,6 +138,45 @@ python merge_sims4_packages.py "C:\Path\To\Mods"
 
 ---
 
+### `download_simfileshare_packages.py`
+
+Downloads `.package` files from SimFileShare folder pages or direct download/file URLs.
+
+#### Download Behavior
+
+- Accepts one or more SimFileShare folder URLs or direct download URLs.
+- Scans folder pages for `.package` links and de-duplicates filenames.
+- Resolves intermediate download pages by following download links or download forms.
+- Saves files to `simfileshare_packages/` by default, or a custom output folder with `--output-dir`.
+- Skips existing completed files unless `--overwrite` is set.
+- Resumes partial `.part` downloads when the server supports byte ranges.
+- Sanitizes Windows-unsafe filename characters.
+- Retries failed folder scans and file downloads.
+
+#### Usage
+
+```bash
+# Download every .package linked from a SimFileShare folder
+python download_simfileshare_packages.py "https://simfileshare.net/folder/123456/"
+
+# Save to a specific folder
+python download_simfileshare_packages.py "https://simfileshare.net/folder/123456/" --output-dir "C:\Path\To\Downloads"
+
+# Preview resolved links without downloading
+python download_simfileshare_packages.py "https://simfileshare.net/folder/123456/" --dry-run
+
+# Download only the first 10 files, useful for testing
+python download_simfileshare_packages.py "https://simfileshare.net/folder/123456/" --limit 10
+
+# Download from multiple folders or direct URLs
+python download_simfileshare_packages.py "https://simfileshare.net/folder/123456/" "https://simfileshare.net/download/789012/"
+
+# Replace existing files instead of skipping them
+python download_simfileshare_packages.py "https://simfileshare.net/folder/123456/" --overwrite
+```
+
+---
+
 ### `find_duplicates.py`
 
 Finds duplicate files by content (SHA-256) and moves duplicates into a `Duplicated` folder.
@@ -184,15 +223,16 @@ python rename_non_latin_files.py "C:\Path\To\Mods"
 
 ## Notes and Safety
 
-- These scripts move or rename files. **Back up your mods folder first.**
-- All scripts recurse into subfolders.
-- Failed moves/renames are reported and skipped.
+- Most scripts move or rename files. **Back up your mods folder first.**
+- Local file-management scripts recurse into subfolders.
+- Failed moves, renames, or downloads are reported and skipped.
 
 ## Suggested Workflow
 
-1. `rename_non_latin_files.py` — fix filename encoding issues
-2. `find_duplicates.py` — remove duplicate content
-3. `identify_merged_sims4_packages.py --unmerge` — split merged packages
-4. `organize_sims4_packages.py` — sort by content type and body type
-5. `organize_files_by_author.py` — (optional) group by creator prefix
-6. `merge_sims4_packages.py` — (optional) re-merge organized folders for faster game loading
+1. `download_simfileshare_packages.py` — (optional) download packages from SimFileShare folders or direct links
+2. `rename_non_latin_files.py` — fix filename encoding issues
+3. `find_duplicates.py` — remove duplicate content
+4. `identify_merged_sims4_packages.py --unmerge` — split merged packages
+5. `organize_sims4_packages.py` — sort by content type and body type
+6. `organize_files_by_author.py` — (optional) group by creator prefix
+7. `merge_sims4_packages.py` — (optional) re-merge organized folders for faster game loading
