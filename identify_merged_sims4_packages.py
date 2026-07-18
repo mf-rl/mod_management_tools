@@ -11,6 +11,7 @@ from typing import Dict, List, Optional, Set, Tuple
 
 CASP_RESOURCE_TYPE = 0x034AEECB
 CAS_PRESET_TYPE = 0xEAA32ADD  # CASPresetResource
+PACKAGE_EXTENSION = ".package"
 MERGED_MANIFEST_TYPES = {
     0x7FB6AD8A,  # modern package manifest used by merge/unmerge tooling
     0x73E93EEB,  # legacy package manifest type
@@ -18,6 +19,8 @@ MERGED_MANIFEST_TYPES = {
 
 
 TGI = Tuple[int, int, int, int]
+MAX_MANIFEST_ENTRY_COUNT = 200000
+MAX_MANIFEST_NAME_BYTES = 32768
 
 
 def read_uint32(data: bytes, offset: int) -> Optional[int]:
@@ -32,106 +35,158 @@ def read_uint64(data: bytes, offset: int) -> Optional[int]:
     return struct.unpack_from("<Q", data, offset)[0]
 
 
-def parse_dbpf_entries(data: bytes) -> List[Dict[str, int]]:
-    if len(data) < 96 or data[:4] != b"DBPF":
-        return []
-
+def read_dbpf_index_info(data: bytes) -> Optional[Tuple[int, int]]:
     index_count = read_uint32(data, 36)
     short_index_offset = read_uint32(data, 40)
     long_index_offset = read_uint64(data, 64)
 
     if index_count is None or short_index_offset is None or long_index_offset is None:
-        return []
+        return None
 
     index_offset = short_index_offset if short_index_offset != 0 else long_index_offset
     if index_count == 0 or index_offset >= len(data):
+        return None
+
+    return int(index_count), int(index_offset)
+
+
+def read_optional_u32(
+    data: bytes,
+    cursor: int,
+    enabled: bool,
+) -> Tuple[Optional[int], int, bool]:
+    if not enabled:
+        return None, cursor, True
+
+    value = read_uint32(data, cursor)
+    if value is None:
+        return None, cursor, False
+
+    return value, cursor + 4, True
+
+
+def read_index_constants(
+    data: bytes,
+    cursor: int,
+    index_flags: int,
+) -> Optional[Tuple[Optional[int], Optional[int], Optional[int], int]]:
+    constant_type, cursor, ok = read_optional_u32(data, cursor, bool(index_flags & 0x1))
+    if not ok:
+        return None
+
+    constant_group, cursor, ok = read_optional_u32(data, cursor, bool(index_flags & 0x2))
+    if not ok:
+        return None
+
+    constant_instance_hi, cursor, ok = read_optional_u32(data, cursor, bool(index_flags & 0x4))
+    if not ok:
+        return None
+
+    return constant_type, constant_group, constant_instance_hi, cursor
+
+
+def read_entry_field_or_constant(
+    data: bytes,
+    cursor: int,
+    constant_value: Optional[int],
+) -> Tuple[Optional[int], int, bool]:
+    if constant_value is not None:
+        return constant_value, cursor, True
+
+    value = read_uint32(data, cursor)
+    if value is None:
+        return None, cursor, False
+
+    return value, cursor + 4, True
+
+
+def parse_dbpf_index_entry(
+    data: bytes,
+    cursor: int,
+    constant_type: Optional[int],
+    constant_group: Optional[int],
+    constant_instance_hi: Optional[int],
+) -> Tuple[Optional[Dict[str, int]], int]:
+    entry_type, cursor, ok = read_entry_field_or_constant(data, cursor, constant_type)
+    if not ok:
+        return None, cursor
+
+    group, cursor, ok = read_entry_field_or_constant(data, cursor, constant_group)
+    if not ok:
+        return None, cursor
+
+    instance_hi, cursor, ok = read_entry_field_or_constant(data, cursor, constant_instance_hi)
+    if not ok:
+        return None, cursor
+
+    instance_lo = read_uint32(data, cursor)
+    resource_offset = read_uint32(data, cursor + 4)
+    size_and_flag = read_uint32(data, cursor + 8)
+    uncompressed_size = read_uint32(data, cursor + 12)
+    if instance_lo is None or resource_offset is None or size_and_flag is None or uncompressed_size is None:
+        return None, cursor
+    cursor += 16
+
+    compressed_size = size_and_flag & 0x7FFFFFFF
+    extended_entry = (size_and_flag & 0x80000000) != 0
+
+    compression_type = 0x0000
+    compression_flags = 0x0000
+    if extended_entry:
+        if cursor + 4 > len(data):
+            return None, cursor
+        compression_type = struct.unpack_from("<H", data, cursor)[0]
+        compression_flags = struct.unpack_from("<H", data, cursor + 2)[0]
+        cursor += 4
+
+    return (
+        {
+            "type": entry_type,
+            "group": group,
+            "instance_hi": instance_hi,
+            "instance_lo": instance_lo,
+            "offset": resource_offset,
+            "compressed_size": compressed_size,
+            "uncompressed_size": uncompressed_size,
+            "compression_type": compression_type,
+            "compression_flags": compression_flags,
+        },
+        cursor,
+    )
+
+
+def parse_dbpf_entries(data: bytes) -> List[Dict[str, int]]:
+    if len(data) < 96 or data[:4] != b"DBPF":
         return []
 
-    cursor = int(index_offset)
+    index_info = read_dbpf_index_info(data)
+    if index_info is None:
+        return []
+    index_count, index_offset = index_info
+
+    cursor = index_offset
     index_flags = read_uint32(data, cursor)
     if index_flags is None:
         return []
     cursor += 4
 
-    constant_type: Optional[int] = None
-    constant_group: Optional[int] = None
-    constant_instance_hi: Optional[int] = None
-
-    if index_flags & 0x1:
-        constant_type = read_uint32(data, cursor)
-        if constant_type is None:
-            return []
-        cursor += 4
-
-    if index_flags & 0x2:
-        constant_group = read_uint32(data, cursor)
-        if constant_group is None:
-            return []
-        cursor += 4
-
-    if index_flags & 0x4:
-        constant_instance_hi = read_uint32(data, cursor)
-        if constant_instance_hi is None:
-            return []
-        cursor += 4
+    constants = read_index_constants(data, cursor, index_flags)
+    if constants is None:
+        return []
+    constant_type, constant_group, constant_instance_hi, cursor = constants
 
     entries: List[Dict[str, int]] = []
-
     for _ in range(index_count):
-        entry_type = constant_type
-        if entry_type is None:
-            entry_type = read_uint32(data, cursor)
-            if entry_type is None:
-                break
-            cursor += 4
-
-        group = constant_group
-        if constant_group is None:
-            group = read_uint32(data, cursor)
-            if group is None:
-                break
-            cursor += 4
-
-        instance_hi = constant_instance_hi
-        if constant_instance_hi is None:
-            instance_hi = read_uint32(data, cursor)
-            if instance_hi is None:
-                break
-            cursor += 4
-
-        instance_lo = read_uint32(data, cursor)
-        resource_offset = read_uint32(data, cursor + 4)
-        size_and_flag = read_uint32(data, cursor + 8)
-        uncompressed_size = read_uint32(data, cursor + 12)
-        if instance_lo is None or resource_offset is None or size_and_flag is None or uncompressed_size is None:
-            break
-        cursor += 16
-
-        compressed_size = size_and_flag & 0x7FFFFFFF
-        extended_entry = (size_and_flag & 0x80000000) != 0
-
-        compression_type = 0x0000
-        compression_flags = 0x0000
-        if extended_entry:
-            if cursor + 4 > len(data):
-                break
-            compression_type = struct.unpack_from("<H", data, cursor)[0]
-            compression_flags = struct.unpack_from("<H", data, cursor + 2)[0]
-            cursor += 4
-
-        entries.append(
-            {
-                "type": entry_type,
-                "group": group,
-                "instance_hi": instance_hi,
-                "instance_lo": instance_lo,
-                "offset": resource_offset,
-                "compressed_size": compressed_size,
-                "uncompressed_size": uncompressed_size,
-                "compression_type": compression_type,
-                "compression_flags": compression_flags,
-            }
+        entry, cursor = parse_dbpf_index_entry(
+            data,
+            cursor,
+            constant_type,
+            constant_group,
+            constant_instance_hi,
         )
+        if entry is None:
+            break
+        entries.append(entry)
 
     return entries
 
@@ -177,42 +232,128 @@ def read_7bit_int(data: bytes, offset: int) -> Tuple[Optional[int], int]:
     return None, cursor
 
 
+def is_valid_manifest_count(value: Optional[int]) -> bool:
+    return value is not None and 0 < value <= MAX_MANIFEST_ENTRY_COUNT
+
+
+def decode_manifest_name(raw_name: bytes) -> str:
+    try:
+        return raw_name.decode("utf-8")
+    except UnicodeDecodeError:
+        return raw_name.decode("latin-1", errors="ignore")
+
+
+def parse_tgi_list(data: bytes, cursor: int, resource_count: int) -> Tuple[Optional[List[TGI]], int]:
+    tgis: List[TGI] = []
+    for _ in range(resource_count):
+        if cursor + 16 > len(data):
+            return None, cursor
+
+        word0 = struct.unpack_from("<I", data, cursor)[0]
+        word1 = struct.unpack_from("<I", data, cursor + 4)[0]
+        word2 = struct.unpack_from("<I", data, cursor + 8)[0]
+        word3 = struct.unpack_from("<I", data, cursor + 12)[0]
+        cursor += 16
+
+        # Sims 4 package-manifest layout commonly stores instance parts first, then type/group.
+        resource_type = word2
+        group = word3
+        instance_hi = word1
+        instance_lo = word0
+        tgis.append((resource_type, group, instance_hi, instance_lo))
+
+    return tgis, cursor
+
+
+def parse_manifest_entries_with_reader(
+    data: bytes,
+    entry_count: int,
+    start_cursor: int,
+    name_reader,
+) -> Optional[List[Dict[str, object]]]:
+    cursor = start_cursor
+    parsed_entries: List[Dict[str, object]] = []
+
+    for _ in range(entry_count):
+        name_length, cursor = name_reader(data, cursor)
+        if name_length is None:
+            return None
+
+        if cursor + name_length > len(data):
+            return None
+
+        raw_name = data[cursor : cursor + name_length]
+        cursor += name_length
+        name = decode_manifest_name(raw_name)
+
+        resource_count = read_uint32(data, cursor)
+        if resource_count is None or resource_count > MAX_MANIFEST_ENTRY_COUNT:
+            return None
+        cursor += 4
+
+        tgis, cursor = parse_tgi_list(data, cursor, resource_count)
+        if tgis is None:
+            return None
+
+        parsed_entries.append({"name": name, "tgis": tgis})
+
+    return parsed_entries
+
+
+def read_u32_name_length(data: bytes, cursor: int) -> Tuple[Optional[int], int]:
+    name_length = read_uint32(data, cursor)
+    if name_length is None or name_length > MAX_MANIFEST_NAME_BYTES:
+        return None, cursor
+    return name_length, cursor + 4
+
+
+def read_7bit_name_length(data: bytes, cursor: int) -> Tuple[Optional[int], int]:
+    return read_7bit_int(data, cursor)
+
+
+def validate_7bit_manifest_layout(payload: bytes, count: int) -> Optional[bool]:
+    cursor = 12
+    for _ in range(min(count, 3)):
+        name_len, cursor = read_7bit_int(payload, cursor)
+        if name_len is None:
+            return None
+        if cursor + name_len > len(payload):
+            return False
+        cursor += name_len
+
+        resource_count = read_uint32(payload, cursor)
+        if resource_count is None or resource_count > MAX_MANIFEST_ENTRY_COUNT:
+            return False
+        cursor += 4
+
+        tgi_bytes = resource_count * 16
+        if cursor + tgi_bytes > len(payload):
+            return False
+        cursor += tgi_bytes
+
+    return True
+
+
 def try_parse_manifest_entry_count(payload: bytes) -> Optional[int]:
     alternate_count = read_uint32(payload, 12) if len(payload) >= 16 else None
-    if alternate_count is not None and 0 < alternate_count <= 200000:
+    if is_valid_manifest_count(alternate_count):
         return alternate_count
 
     # Common manifest layouts start with at least 3 uint32 values where the third is count.
     if len(payload) >= 12:
         maybe_count = read_uint32(payload, 8)
-        if maybe_count is not None and 0 < maybe_count <= 200000:
+        if is_valid_manifest_count(maybe_count):
             return maybe_count
 
     # Some variants may store a 7-bit length string after a short header.
     if len(payload) > 16:
         count = read_uint32(payload, 8)
-        if count is None or count <= 0 or count > 200000:
+        if not is_valid_manifest_count(count):
             return None
 
-        cursor = 12
-        for _ in range(min(count, 3)):
-            name_len, cursor = read_7bit_int(payload, cursor)
-            if name_len is None:
-                return count
-            if cursor + name_len > len(payload):
-                return None
-            cursor += name_len
-
-            resource_count = read_uint32(payload, cursor)
-            if resource_count is None or resource_count > 200000:
-                return None
-            cursor += 4
-
-            tgi_bytes = resource_count * 16
-            if cursor + tgi_bytes > len(payload):
-                return None
-            cursor += tgi_bytes
-
+        layout_valid = validate_7bit_manifest_layout(payload, count)
+        if layout_valid is False:
+            return None
         return count
 
     return None
@@ -224,106 +365,30 @@ def try_parse_manifest_entries(payload: bytes) -> Optional[List[Dict[str, object
             return None
 
         entry_count = read_uint32(data, 12)
-        if entry_count is None or entry_count <= 0 or entry_count > 200000:
+        if not is_valid_manifest_count(entry_count):
             return None
 
-        cursor = 16
-        parsed_entries: List[Dict[str, object]] = []
-
-        for _ in range(entry_count):
-            name_length = read_uint32(data, cursor)
-            if name_length is None or name_length > 32768:
-                return None
-            cursor += 4
-
-            if cursor + name_length > len(data):
-                return None
-
-            raw_name = data[cursor : cursor + name_length]
-            cursor += name_length
-
-            try:
-                name = raw_name.decode("utf-8")
-            except UnicodeDecodeError:
-                name = raw_name.decode("latin-1", errors="ignore")
-
-            resource_count = read_uint32(data, cursor)
-            if resource_count is None or resource_count > 200000:
-                return None
-            cursor += 4
-
-            tgis: List[TGI] = []
-            for _resource_index in range(resource_count):
-                if cursor + 16 > len(data):
-                    return None
-                word0 = struct.unpack_from("<I", data, cursor)[0]
-                word1 = struct.unpack_from("<I", data, cursor + 4)[0]
-                word2 = struct.unpack_from("<I", data, cursor + 8)[0]
-                word3 = struct.unpack_from("<I", data, cursor + 12)[0]
-                cursor += 16
-
-                # Sims 4 package-manifest layout commonly stores instance parts first, then type/group.
-                resource_type = word2
-                group = word3
-                instance_hi = word1
-                instance_lo = word0
-                tgis.append((resource_type, group, instance_hi, instance_lo))
-
-            parsed_entries.append({"name": name, "tgis": tgis})
-
-        return parsed_entries
+        return parse_manifest_entries_with_reader(
+            data,
+            entry_count,
+            16,
+            read_u32_name_length,
+        )
 
     def parse_with_7bit_name_length(data: bytes) -> Optional[List[Dict[str, object]]]:
         if len(data) < 12:
             return None
 
         entry_count = read_uint32(data, 8)
-        if entry_count is None or entry_count <= 0 or entry_count > 200000:
+        if not is_valid_manifest_count(entry_count):
             return None
 
-        cursor = 12
-        parsed_entries: List[Dict[str, object]] = []
-
-        for _ in range(entry_count):
-            name_length, cursor = read_7bit_int(data, cursor)
-            if name_length is None:
-                return None
-
-            if cursor + name_length > len(data):
-                return None
-
-            raw_name = data[cursor : cursor + name_length]
-            cursor += name_length
-
-            try:
-                name = raw_name.decode("utf-8")
-            except UnicodeDecodeError:
-                name = raw_name.decode("latin-1", errors="ignore")
-
-            resource_count = read_uint32(data, cursor)
-            if resource_count is None or resource_count > 200000:
-                return None
-            cursor += 4
-
-            tgis: List[TGI] = []
-            for _resource_index in range(resource_count):
-                if cursor + 16 > len(data):
-                    return None
-                word0 = struct.unpack_from("<I", data, cursor)[0]
-                word1 = struct.unpack_from("<I", data, cursor + 4)[0]
-                word2 = struct.unpack_from("<I", data, cursor + 8)[0]
-                word3 = struct.unpack_from("<I", data, cursor + 12)[0]
-                cursor += 16
-
-                resource_type = word2
-                group = word3
-                instance_hi = word1
-                instance_lo = word0
-                tgis.append((resource_type, group, instance_hi, instance_lo))
-
-            parsed_entries.append({"name": name, "tgis": tgis})
-
-        return parsed_entries
+        return parse_manifest_entries_with_reader(
+            data,
+            entry_count,
+            12,
+            read_7bit_name_length,
+        )
 
     parsed = parse_with_u32_name_length(payload)
     if parsed is not None:
@@ -364,8 +429,8 @@ def sanitize_package_name(name: str) -> str:
     cleaned = "".join(char for char in cleaned if char not in '<>:"|?*').strip(" .")
     if not cleaned:
         cleaned = "unmerged_item"
-    if not cleaned.lower().endswith(".package"):
-        cleaned += ".package"
+    if not cleaned.lower().endswith(PACKAGE_EXTENSION):
+        cleaned += PACKAGE_EXTENSION
     return cleaned
 
 
@@ -382,6 +447,33 @@ def build_unique_destination(target_folder: Path, file_name: str) -> Path:
         if not candidate.exists():
             return candidate
         counter += 1
+
+
+def sanitize_folder_name(name: str) -> str:
+    cleaned = name.replace("\x00", "").strip()
+    cleaned = cleaned.replace("/", "_").replace("\\", "_")
+    cleaned = "".join(char for char in cleaned if char not in '<>:"|?*').strip(" .")
+    if not cleaned:
+        cleaned = "unmerged_item"
+    return cleaned
+
+
+def build_unique_folder(base_folder: Path, preferred_name: str) -> Path:
+    folder_name = sanitize_folder_name(preferred_name)
+    destination = base_folder / folder_name
+    if not destination.exists():
+        return destination
+
+    counter = 1
+    while True:
+        candidate = base_folder / f"{folder_name}_{counter}"
+        if not candidate.exists():
+            return candidate
+        counter += 1
+
+
+def build_stable_folder(base_folder: Path, preferred_name: str) -> Path:
+    return base_folder / sanitize_folder_name(preferred_name)
 
 
 def build_dbpf_package(resources: List[Dict[str, object]]) -> bytes:
@@ -443,22 +535,7 @@ def build_dbpf_package(resources: List[Dict[str, object]]) -> bytes:
     return bytes(output)
 
 
-def unmerge_package_file(package_path: Path, output_folder: Path) -> Tuple[List[Path], str]:
-    try:
-        raw_data = package_path.read_bytes()
-    except OSError as exc:
-        return [], f"read failed: {exc}"
-
-    entries = parse_dbpf_entries(raw_data)
-    if not entries:
-        return [], "invalid DBPF"
-
-    manifest = find_manifest_entry(raw_data, entries)
-    if manifest is None:
-        return [], "manifest not found or unsupported manifest format"
-
-    manifest_entries: List[Dict[str, object]] = manifest["manifest_entries"]
-
+def build_resource_map(raw_data: bytes, entries: List[Dict[str, int]]) -> Dict[TGI, Dict[str, object]]:
     resource_map: Dict[TGI, Dict[str, object]] = {}
     for entry in entries:
         if entry["type"] in MERGED_MANIFEST_TYPES:
@@ -485,6 +562,66 @@ def unmerge_package_file(package_path: Path, output_folder: Path) -> Tuple[List[
             "uncompressed_size": int(entry["uncompressed_size"]),
         }
 
+    return resource_map
+
+
+def resolve_resource_from_manifest_tgi(
+    resource_map: Dict[TGI, Dict[str, object]],
+    key: TGI,
+) -> Tuple[Optional[Dict[str, object]], TGI, bool]:
+    resource = resource_map.get(key)
+    if resource is not None:
+        return resource, key, False
+
+    # Compatibility fallback: some tools/dumps may serialize instance halves swapped.
+    swapped_key: TGI = (key[0], key[1], key[3], key[2])
+    resource = resource_map.get(swapped_key)
+    if resource is not None:
+        return resource, swapped_key, True
+
+    return None, key, False
+
+
+def collect_manifest_entry_resources(
+    tgis: List[TGI],
+    resource_map: Dict[TGI, Dict[str, object]],
+    used_keys: Set[TGI],
+) -> Tuple[List[Dict[str, object]], int, int]:
+    selected_resources: List[Dict[str, object]] = []
+    matched_resources_total = 0
+    swapped_match_total = 0
+
+    for key in tgis:
+        resource, resolved_key, used_swapped_key = resolve_resource_from_manifest_tgi(resource_map, key)
+        if resource is None or resolved_key in used_keys:
+            continue
+
+        selected_resources.append(resource)
+        used_keys.add(resolved_key)
+        matched_resources_total += 1
+        if used_swapped_key:
+            swapped_match_total += 1
+
+    return selected_resources, matched_resources_total, swapped_match_total
+
+
+def unmerge_package_file(package_path: Path, output_folder: Path) -> Tuple[List[Path], str]:
+    try:
+        raw_data = package_path.read_bytes()
+    except OSError as exc:
+        return [], f"read failed: {exc}"
+
+    entries = parse_dbpf_entries(raw_data)
+    if not entries:
+        return [], "invalid DBPF"
+
+    manifest = find_manifest_entry(raw_data, entries)
+    if manifest is None:
+        return [], "manifest not found or unsupported manifest format"
+
+    manifest_entries: List[Dict[str, object]] = manifest["manifest_entries"]
+    resource_map = build_resource_map(raw_data, entries)
+
     if not manifest_entries:
         return unmerge_empty_manifest_by_casp_instance(package_path, output_folder, resource_map)
 
@@ -493,37 +630,17 @@ def unmerge_package_file(package_path: Path, output_folder: Path) -> Tuple[List[
     matched_resources_total = 0
     swapped_match_total = 0
 
-    def resolve_resource_from_manifest_tgi(key: TGI) -> Tuple[Optional[Dict[str, object]], TGI, bool]:
-        resource = resource_map.get(key)
-        if resource is not None:
-            return resource, key, False
-
-        # Compatibility fallback: some tools/dumps may serialize instance halves swapped.
-        swapped_key: TGI = (key[0], key[1], key[3], key[2])
-        resource = resource_map.get(swapped_key)
-        if resource is not None:
-            return resource, swapped_key, True
-
-        return None, key, False
-
     for entry in manifest_entries:
         original_name = str(entry["name"])
         tgis = entry["tgis"]
 
-        selected_resources: List[Dict[str, object]] = []
-        for key in tgis:
-            resource, resolved_key, used_swapped_key = resolve_resource_from_manifest_tgi(key)
-            if resource is None:
-                continue
-
-            if resolved_key in used_keys:
-                continue
-
-            selected_resources.append(resource)
-            used_keys.add(resolved_key)
-            matched_resources_total += 1
-            if used_swapped_key:
-                swapped_match_total += 1
+        selected_resources, matched_count, swapped_count = collect_manifest_entry_resources(
+            tgis,
+            resource_map,
+            used_keys,
+        )
+        matched_resources_total += matched_count
+        swapped_match_total += swapped_count
 
         if not selected_resources:
             continue
@@ -568,31 +685,7 @@ def unmerge_without_manifest(package_path: Path, output_folder: Path) -> Tuple[L
     if not entries:
         return [], "invalid DBPF"
 
-    resource_map: Dict[TGI, Dict[str, object]] = {}
-    for entry in entries:
-        if entry["type"] in MERGED_MANIFEST_TYPES:
-            continue
-
-        blob = read_resource_blob(raw_data, entry)
-        if blob is None:
-            continue
-
-        key: TGI = (
-            int(entry["type"]),
-            int(entry["group"]),
-            int(entry["instance_hi"]),
-            int(entry["instance_lo"]),
-        )
-        resource_map[key] = {
-            "type": key[0],
-            "group": key[1],
-            "instance_hi": key[2],
-            "instance_lo": key[3],
-            "blob": blob,
-            "compression_type": int(entry["compression_type"]),
-            "compression_flags": int(entry.get("compression_flags", 0)),
-            "uncompressed_size": int(entry["uncompressed_size"]),
-        }
+    resource_map = build_resource_map(raw_data, entries)
 
     if not resource_map:
         return [], "no resources available for heuristic unmerge"
@@ -643,8 +736,7 @@ def unmerge_empty_manifest_by_casp_instance(
         destination.write_bytes(package_bytes)
         created_paths.append(destination)
 
-        for key in keys:
-            used_keys.add(key)
+        used_keys.update(keys)
 
     shared_resources = [
         resource
@@ -687,7 +779,7 @@ def send_path_to_trash_windows(path: Path) -> bool:
         _fields_ = [
             ("hwnd", ctypes.c_void_p),
             ("wFunc", ctypes.c_uint),
-            ("pFrom", ctypes.c_wchar_p),
+            ("pFrom", ctypes.c_void_p),
             ("pTo", ctypes.c_wchar_p),
             ("fFlags", ctypes.c_ushort),
             ("fAnyOperationsAborted", ctypes.c_bool),
@@ -703,7 +795,8 @@ def send_path_to_trash_windows(path: Path) -> bool:
 
     operation = SHFILEOPSTRUCTW()
     operation.wFunc = FO_DELETE
-    operation.pFrom = f"{str(path)}\0\0"
+    from_buffer = ctypes.create_unicode_buffer(f"{str(path)}\0\0")
+    operation.pFrom = ctypes.cast(from_buffer, ctypes.c_void_p).value
     operation.fFlags = FOF_ALLOWUNDO | FOF_NOCONFIRMATION | FOF_NOERRORUI | FOF_SILENT
 
     result = ctypes.windll.shell32.SHFileOperationW(ctypes.byref(operation))
@@ -711,42 +804,14 @@ def send_path_to_trash_windows(path: Path) -> bool:
 
 
 def send_paths_to_trash_windows_batched(paths: List[Path], chunk_size: int = 200) -> List[Path]:
-    """Send files to recycle bin in batches to reduce Explorer blocking on large sets."""
+    """Send files to recycle bin on Windows with robust per-file calls."""
     if not paths:
         return []
-
-    class SHFILEOPSTRUCTW(ctypes.Structure):
-        _fields_ = [
-            ("hwnd", ctypes.c_void_p),
-            ("wFunc", ctypes.c_uint),
-            ("pFrom", ctypes.c_wchar_p),
-            ("pTo", ctypes.c_wchar_p),
-            ("fFlags", ctypes.c_ushort),
-            ("fAnyOperationsAborted", ctypes.c_bool),
-            ("hNameMappings", ctypes.c_void_p),
-            ("lpszProgressTitle", ctypes.c_wchar_p),
-        ]
-
-    FO_DELETE = 3
-    FOF_SILENT = 0x0004
-    FOF_NOCONFIRMATION = 0x0010
-    FOF_ALLOWUNDO = 0x0040
-    FOF_NOERRORUI = 0x0400
 
     failed: List[Path] = []
 
     for index in range(0, len(paths), chunk_size):
         chunk = paths[index : index + chunk_size]
-        operation = SHFILEOPSTRUCTW()
-        operation.wFunc = FO_DELETE
-        operation.pFrom = "\0".join(str(path) for path in chunk) + "\0\0"
-        operation.fFlags = FOF_ALLOWUNDO | FOF_NOCONFIRMATION | FOF_NOERRORUI | FOF_SILENT
-
-        result = ctypes.windll.shell32.SHFileOperationW(ctypes.byref(operation))
-        if result == 0 and not operation.fAnyOperationsAborted:
-            continue
-
-        # Fall back to single-file calls only when a batch fails.
         for path in chunk:
             if not send_path_to_trash_windows(path):
                 failed.append(path)
@@ -797,14 +862,8 @@ def move_paths_to_folder(paths: List[Path], destination_folder: Path) -> Tuple[L
     return moved, failed
 
 
-def detect_merged_package(
-    package_path: Path,
-    *,
-    min_casparts_primary: int,
-    min_casparts_secondary: int,
-    min_caspart_density: float,
-) -> Dict[str, object]:
-    result: Dict[str, object] = {
+def initialize_detection_result(package_path: Path) -> Dict[str, object]:
+    return {
         "path": str(package_path),
         "status": "NotMerged",
         "confidence": "none",
@@ -818,25 +877,153 @@ def detect_merged_package(
         "casp_density": 0.0,
     }
 
-    try:
-        raw_data = package_path.read_bytes()
-    except OSError as exc:
-        result["status"] = "Unreadable"
-        result["confidence"] = "none"
-        result["reason"] = f"could not read file: {exc}"
-        return result
 
-    entries = parse_dbpf_entries(raw_data)
-    if not entries:
-        result["status"] = "Unreadable"
-        result["reason"] = "not a valid/parseable DBPF package"
-        return result
+def set_unreadable_result(result: Dict[str, object], reason: str) -> Dict[str, object]:
+    result["status"] = "Unreadable"
+    result["confidence"] = "none"
+    result["reason"] = reason
+    return result
 
-    result["resource_count"] = len(entries)
+
+def update_detection_result(
+    result: Dict[str, object],
+    *,
+    status: str,
+    confidence: str,
+    detection_mode: str,
+    reason: str,
+) -> Dict[str, object]:
+    result["status"] = status
+    result["confidence"] = confidence
+    result["detection_mode"] = detection_mode
+    result["reason"] = reason
+    return result
+
+
+def build_entry_type_counts(entries: List[Dict[str, int]]) -> Dict[int, int]:
     type_counts: Dict[int, int] = {}
     for entry in entries:
         entry_type = int(entry["type"])
         type_counts[entry_type] = type_counts.get(entry_type, 0) + 1
+    return type_counts
+
+
+def find_manifest_marker(
+    raw_data: bytes,
+    entries: List[Dict[str, int]],
+) -> Optional[Tuple[int, Optional[int]]]:
+    for entry in entries:
+        entry_type = int(entry["type"])
+        if entry_type not in MERGED_MANIFEST_TYPES:
+            continue
+
+        payload = read_resource_payload(raw_data, entry)
+        entry_count = try_parse_manifest_entry_count(payload) if payload is not None else None
+        return entry_type, entry_count
+
+    return None
+
+
+def finalize_manifest_detection(
+    result: Dict[str, object],
+    entry_type: int,
+    entry_count: Optional[int],
+) -> Dict[str, object]:
+    manifest_type = f"0x{entry_type:08X}"
+    result["manifest_type"] = manifest_type
+    result["manifest_entry_count"] = entry_count
+
+    if entry_count is None:
+        reason = f"found manifest resource type {manifest_type} (known merged-package marker)"
+    else:
+        reason = f"found manifest resource type {manifest_type} with {entry_count} entry/entries"
+
+    return update_detection_result(
+        result,
+        status="Merged",
+        confidence="high",
+        detection_mode="manifest",
+        reason=reason,
+    )
+
+
+def classify_without_manifest(
+    result: Dict[str, object],
+    package_path: Path,
+    *,
+    casp_count: int,
+    casp_density: float,
+    unique_type_count: int,
+    has_cas_preset: bool,
+    min_casparts_primary: int,
+    min_casparts_secondary: int,
+    min_caspart_density: float,
+) -> Dict[str, object]:
+    file_name_lower = package_path.name.lower()
+
+    if casp_count >= 200 and casp_density >= 0.25 and unique_type_count <= 10 and not has_cas_preset:
+        return update_detection_result(
+            result,
+            status="Merged",
+            confidence="high",
+            detection_mode="legacy-heuristic",
+            reason=(
+                "strong legacy merged heuristic: "
+                f"CASPART count ({casp_count}), density ({casp_density:.2f}), "
+                f"resource type variety ({unique_type_count})"
+            ),
+        )
+
+    if "tsrlibrary" in file_name_lower or "tsr_library" in file_name_lower:
+        return update_detection_result(
+            result,
+            status="ProbablyMerged",
+            confidence="medium",
+            detection_mode="filename-heuristic",
+            reason="filename suggests TSR library/merged package",
+        )
+
+    if casp_count > min_casparts_primary:
+        return update_detection_result(
+            result,
+            status="ProbablyMerged",
+            confidence="medium",
+            detection_mode="count-heuristic",
+            reason=f"very high CASPART count ({casp_count}) in one package",
+        )
+
+    if casp_count > min_casparts_secondary and casp_density > min_caspart_density:
+        return update_detection_result(
+            result,
+            status="ProbablyMerged",
+            confidence="medium",
+            detection_mode="count-density-heuristic",
+            reason=f"high CASPART count ({casp_count}) and density ({casp_density:.2f})",
+        )
+
+    return result
+
+
+def detect_merged_package(
+    package_path: Path,
+    *,
+    min_casparts_primary: int,
+    min_casparts_secondary: int,
+    min_caspart_density: float,
+) -> Dict[str, object]:
+    result = initialize_detection_result(package_path)
+
+    try:
+        raw_data = package_path.read_bytes()
+    except OSError as exc:
+        return set_unreadable_result(result, f"could not read file: {exc}")
+
+    entries = parse_dbpf_entries(raw_data)
+    if not entries:
+        return set_unreadable_result(result, "not a valid/parseable DBPF package")
+
+    result["resource_count"] = len(entries)
+    type_counts = build_entry_type_counts(entries)
     result["unique_type_count"] = len(type_counts)
 
     casp_count = sum(1 for entry in entries if entry["type"] == CASP_RESOURCE_TYPE)
@@ -845,72 +1032,22 @@ def detect_merged_package(
     casp_density = (casp_count / len(entries)) if entries else 0.0
     result["casp_density"] = round(casp_density, 4)
 
-    for entry in entries:
-        entry_type = entry["type"]
-        if entry_type not in MERGED_MANIFEST_TYPES:
-            continue
+    manifest_marker = find_manifest_marker(raw_data, entries)
+    if manifest_marker is not None:
+        entry_type, entry_count = manifest_marker
+        return finalize_manifest_detection(result, entry_type, entry_count)
 
-        payload = read_resource_payload(raw_data, entry)
-        entry_count = try_parse_manifest_entry_count(payload) if payload is not None else None
-
-        result["status"] = "Merged"
-        result["confidence"] = "high"
-        result["detection_mode"] = "manifest"
-        result["manifest_type"] = f"0x{entry_type:08X}"
-        result["manifest_entry_count"] = entry_count
-
-        if entry_count is None:
-            result["reason"] = (
-                f"found manifest resource type {result['manifest_type']} (known merged-package marker)"
-            )
-        else:
-            result["reason"] = (
-                f"found manifest resource type {result['manifest_type']} with {entry_count} entry/entries"
-            )
-        return result
-
-    file_name_lower = package_path.name.lower()
-
-    # Legacy/manual merged packages often have no manifest marker but still show
-    # a very strong CASPART-heavy profile in a narrow set of resource types.
-    # We treat these as high-confidence merged for detection purposes only.
-    if casp_count >= 200 and casp_density >= 0.25 and len(type_counts) <= 10 and not has_cas_preset:
-        result["status"] = "Merged"
-        result["confidence"] = "high"
-        result["detection_mode"] = "legacy-heuristic"
-        result["reason"] = (
-            "strong legacy merged heuristic: "
-            f"CASPART count ({casp_count}), density ({casp_density:.2f}), "
-            f"resource type variety ({len(type_counts)})"
-        )
-        return result
-
-    if "tsrlibrary" in file_name_lower or "tsr_library" in file_name_lower:
-        result["status"] = "ProbablyMerged"
-        result["confidence"] = "medium"
-        result["detection_mode"] = "filename-heuristic"
-        result["reason"] = "filename suggests TSR library/merged package"
-        return result
-
-    if casp_count > min_casparts_primary:
-        result["status"] = "ProbablyMerged"
-        result["confidence"] = "medium"
-        result["detection_mode"] = "count-heuristic"
-        result["reason"] = (
-            f"very high CASPART count ({casp_count}) in one package"
-        )
-        return result
-
-    if casp_count > min_casparts_secondary and casp_density > min_caspart_density:
-        result["status"] = "ProbablyMerged"
-        result["confidence"] = "medium"
-        result["detection_mode"] = "count-density-heuristic"
-        result["reason"] = (
-            f"high CASPART count ({casp_count}) and density ({casp_density:.2f})"
-        )
-        return result
-
-    return result
+    return classify_without_manifest(
+        result,
+        package_path,
+        casp_count=casp_count,
+        casp_density=casp_density,
+        unique_type_count=len(type_counts),
+        has_cas_preset=has_cas_preset,
+        min_casparts_primary=min_casparts_primary,
+        min_casparts_secondary=min_casparts_secondary,
+        min_caspart_density=min_caspart_density,
+    )
 
 
 def list_package_files(base_path: Path) -> List[Path]:
@@ -1024,190 +1161,308 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def main() -> None:
-    args = parse_args()
+def get_selected_scan_path(args: argparse.Namespace) -> Path:
     selected_path = args.scan_path or args.path
     if selected_path is None:
         print("No path provided. Use positional path or --path.")
         raise SystemExit(1)
 
     base_path = Path(selected_path).expanduser().resolve()
-
     if not base_path.exists() or not base_path.is_dir():
         print(f"Invalid directory: {base_path}")
         raise SystemExit(1)
 
-    findings, stats = analyze_folder(
-        base_path,
-        include_probable=args.include_probable,
-        min_casparts_primary=args.min_casparts_primary,
-        min_casparts_secondary=args.min_casparts_secondary,
-        min_caspart_density=args.min_caspart_density,
-    )
+    return base_path
 
-    detected_merged_paths = [
-        Path(str(finding["path"]))
-        for finding in findings
-        if finding["status"] in {"Merged", "ProbablyMerged"}
-    ]
 
-    move_target: Optional[Path] = None
-    if args.move_path:
-        move_target = Path(args.move_path).expanduser().resolve()
+def get_move_target(move_path: Optional[str]) -> Optional[Path]:
+    if not move_path:
+        return None
+    return Path(move_path).expanduser().resolve()
 
-    if args.unmerge:
-        if args.include_probable:
-            unmerge_candidates = [
-                finding for finding in findings if finding["status"] in {"Merged", "ProbablyMerged"}
-            ]
+
+def finding_paths(findings: List[Dict[str, object]], statuses: Set[str]) -> List[Path]:
+    return [Path(str(finding["path"])) for finding in findings if finding["status"] in statuses]
+
+
+def build_unmerge_candidates(
+    findings: List[Dict[str, object]],
+    include_probable: bool,
+) -> List[Dict[str, object]]:
+    statuses = {"Merged", "ProbablyMerged"} if include_probable else {"Merged"}
+    selected = [finding for finding in findings if finding["status"] in statuses]
+
+    # Guard against duplicate detections of the same source path.
+    deduped: List[Dict[str, object]] = []
+    seen_paths: Set[str] = set()
+    for finding in selected:
+        source_path = str(finding.get("path", ""))
+        if source_path in seen_paths:
+            continue
+        seen_paths.add(source_path)
+        deduped.append(finding)
+
+    return deduped
+
+
+def format_relative_path(base_path: Path, target_path: Path) -> str:
+    try:
+        return str(target_path.relative_to(base_path))
+    except ValueError:
+        return str(target_path)
+
+
+def print_path_reason_lines(
+    base_path: Path,
+    entries: List[Tuple[Path, str]],
+) -> None:
+    for path, reason in entries:
+        display_path = format_relative_path(base_path, path)
+        print(f"- {display_path} | reason={reason}")
+
+
+def print_path_lines(base_path: Path, paths: List[Path]) -> None:
+    for path in paths:
+        display_path = format_relative_path(base_path, path)
+        print(f"- {display_path}")
+
+
+def unmerge_single_candidate(
+    candidate: Dict[str, object],
+    unmerged_folder: Path,
+) -> Tuple[Path, List[Path], str]:
+    merged_file = Path(str(candidate["path"]))
+    detection_mode = str(candidate.get("detection_mode", "none"))
+
+    per_package_output_folder = build_stable_folder(unmerged_folder, merged_file.stem)
+    per_package_output_folder.mkdir(parents=True, exist_ok=True)
+
+    if detection_mode == "manifest":
+        created_paths, status_text = unmerge_package_file(merged_file, per_package_output_folder)
+    else:
+        created_paths, status_text = unmerge_without_manifest(merged_file, per_package_output_folder)
+
+    return merged_file, created_paths, status_text
+
+
+def execute_unmerge_candidates(
+    unmerge_candidates: List[Dict[str, object]],
+    unmerged_folder: Path,
+) -> Tuple[List[Path], List[Tuple[Path, str]], int]:
+    processed_files: List[Path] = []
+    failed_files: List[Tuple[Path, str]] = []
+    total_created = 0
+
+    for candidate in unmerge_candidates:
+        merged_file, created_paths, status_text = unmerge_single_candidate(candidate, unmerged_folder)
+        if not created_paths:
+            failed_files.append((merged_file, status_text))
+            continue
+
+        processed_files.append(merged_file)
+        total_created += len(created_paths)
+
+    return processed_files, failed_files, total_created
+
+
+def build_unmerge_report(
+    unmerged_folder: Path,
+    merged_files: List[Path],
+    processed_files: List[Path],
+    failed_files: List[Tuple[Path, str]],
+    total_created: int,
+    delete_originals: bool,
+    trashed_failures: List[Path],
+    move_target: Optional[Path],
+    moved_files: List[Path],
+    move_failures: List[Tuple[Path, str]],
+) -> Dict[str, object]:
+    return {
+        "output_folder": str(unmerged_folder),
+        "merged_detected": len(merged_files),
+        "processed": len(processed_files),
+        "failed": len(failed_files),
+        "unmerged_files_created": total_created,
+        "delete_originals_requested": delete_originals,
+        "trash_delete_failures": len(trashed_failures),
+        "move_target": str(move_target) if move_target is not None else None,
+        "moved_after_unmerge": len(moved_files),
+        "move_failures": len(move_failures),
+    }
+
+
+def emit_unmerge_json(
+    findings: List[Dict[str, object]],
+    stats: Dict[str, int],
+    unmerge_report: Dict[str, object],
+    failed_files: List[Tuple[Path, str]],
+    trashed_failures: List[Path],
+    move_failures: List[Tuple[Path, str]],
+) -> None:
+    payload: Dict[str, object] = {
+        "findings": findings,
+        "stats": stats,
+        "unmerge": {
+            **unmerge_report,
+            "failed_details": [
+                {"path": str(path), "reason": reason} for path, reason in failed_files
+            ],
+            "trash_delete_failures_paths": [str(path) for path in trashed_failures],
+            "move_failures_details": [
+                {"path": str(path), "reason": reason} for path, reason in move_failures
+            ],
+        },
+    }
+    print(json.dumps(payload, indent=2))
+
+
+def print_unmerge_text_summary(
+    base_path: Path,
+    unmerge_report: Dict[str, object],
+    failed_files: List[Tuple[Path, str]],
+    delete_originals: bool,
+    processed_files: List[Path],
+    trashed_failures: List[Path],
+    move_target: Optional[Path],
+    moved_files: List[Path],
+    move_failures: List[Tuple[Path, str]],
+) -> None:
+    print(f"Scanning path: {base_path}")
+    print(f"Unmerge output folder: {unmerge_report['output_folder']}")
+    print(f"Merged files detected: {unmerge_report['merged_detected']}")
+    print(f"Merged files processed: {unmerge_report['processed']}")
+    print(f"Unmerged files created: {unmerge_report['unmerged_files_created']}")
+    print(f"Files failed to unmerge: {unmerge_report['failed']}")
+
+    if failed_files:
+        print("Failed files:")
+        print_path_reason_lines(base_path, failed_files)
+
+    if delete_originals:
+        deleted_count = len(processed_files) - len(trashed_failures)
+        print(f"Original merged files sent to trash: {deleted_count}")
+        if trashed_failures:
+            print("Failed to send these originals to trash:")
+            print_path_lines(base_path, trashed_failures)
+
+    if move_target is not None:
+        if delete_originals:
+            print("Move step skipped because originals were sent to trash.")
         else:
-            unmerge_candidates = [
-                finding for finding in findings if finding["status"] == "Merged"
-            ]
+            print(f"Merged files moved: {len(moved_files)} -> {move_target}")
+            if move_failures:
+                print("Failed to move these files:")
+                print_path_reason_lines(base_path, move_failures)
 
-        merged_files = [Path(str(finding["path"])) for finding in unmerge_candidates]
 
-        if not merged_files:
-            if args.json:
-                print(json.dumps({"findings": findings, "stats": stats, "unmerge": {"processed": 0}}, indent=2))
-                return
+def handle_unmerge_mode(
+    args: argparse.Namespace,
+    base_path: Path,
+    findings: List[Dict[str, object]],
+    stats: Dict[str, int],
+    move_target: Optional[Path],
+) -> None:
+    unmerge_candidates = build_unmerge_candidates(findings, args.include_probable)
+    merged_files = [Path(str(finding["path"])) for finding in unmerge_candidates]
 
-            print(f"Scanning path: {base_path}")
-            if args.include_probable:
-                print("No merged/probable merged files found to unmerge.")
-            else:
-                print("No high-confidence merged files found to unmerge.")
-            return
-
-        delete_originals = prompt_delete_originals()
-
-        unmerged_folder = base_path.parent / f"{base_path.name}_unmerged"
-        unmerged_folder.mkdir(parents=True, exist_ok=True)
-
-        processed_files: List[Path] = []
-        failed_files: List[Tuple[Path, str]] = []
-        total_created = 0
-
-        for candidate in unmerge_candidates:
-            merged_file = Path(str(candidate["path"]))
-            detection_mode = str(candidate.get("detection_mode", "none"))
-
-            if detection_mode == "manifest":
-                created_paths, status_text = unmerge_package_file(merged_file, unmerged_folder)
-            else:
-                created_paths, status_text = unmerge_without_manifest(merged_file, unmerged_folder)
-
-            if not created_paths:
-                failed_files.append((merged_file, status_text))
-                continue
-
-            processed_files.append(merged_file)
-            total_created += len(created_paths)
-
-        trashed_failures: List[Path] = []
-        if delete_originals and processed_files:
-            trashed_failures = send_paths_to_trash(processed_files)
-
-        moved_files: List[Path] = []
-        move_failures: List[Tuple[Path, str]] = []
-        if move_target is not None and not delete_originals:
-            move_candidates = [path for path in merged_files if path.exists()]
-            moved_files, move_failures = move_paths_to_folder(move_candidates, move_target)
-
-        unmerge_report = {
-            "output_folder": str(unmerged_folder),
-            "merged_detected": len(merged_files),
-            "processed": len(processed_files),
-            "failed": len(failed_files),
-            "unmerged_files_created": total_created,
-            "delete_originals_requested": delete_originals,
-            "trash_delete_failures": len(trashed_failures),
-            "move_target": str(move_target) if move_target is not None else None,
-            "moved_after_unmerge": len(moved_files),
-            "move_failures": len(move_failures),
-        }
-
+    if not merged_files:
         if args.json:
-            payload: Dict[str, object] = {
-                "findings": findings,
-                "stats": stats,
-                "unmerge": {
-                    **unmerge_report,
-                    "failed_details": [
-                        {"path": str(path), "reason": reason} for path, reason in failed_files
-                    ],
-                    "trash_delete_failures_paths": [str(path) for path in trashed_failures],
-                    "move_failures_details": [
-                        {"path": str(path), "reason": reason} for path, reason in move_failures
-                    ],
-                },
-            }
-            print(json.dumps(payload, indent=2))
+            print(json.dumps({"findings": findings, "stats": stats, "unmerge": {"processed": 0}}, indent=2))
             return
 
         print(f"Scanning path: {base_path}")
-        print(f"Unmerge output folder: {unmerged_folder}")
-        print(f"Merged files detected: {unmerge_report['merged_detected']}")
-        print(f"Merged files processed: {unmerge_report['processed']}")
-        print(f"Unmerged files created: {unmerge_report['unmerged_files_created']}")
-        print(f"Files failed to unmerge: {unmerge_report['failed']}")
-
-        if failed_files:
-            print("Failed files:")
-            for failed_path, reason in failed_files:
-                try:
-                    display_path = str(failed_path.relative_to(base_path))
-                except ValueError:
-                    display_path = str(failed_path)
-                print(f"- {display_path} | reason={reason}")
-
-        if delete_originals:
-            deleted_count = len(processed_files) - len(trashed_failures)
-            print(f"Original merged files sent to trash: {deleted_count}")
-            if trashed_failures:
-                print("Failed to send these originals to trash:")
-                for failed_path in trashed_failures:
-                    try:
-                        display_path = str(failed_path.relative_to(base_path))
-                    except ValueError:
-                        display_path = str(failed_path)
-                    print(f"- {display_path}")
-
-        if move_target is not None:
-            if delete_originals:
-                print("Move step skipped because originals were sent to trash.")
-            else:
-                print(f"Merged files moved: {len(moved_files)} -> {move_target}")
-                if move_failures:
-                    print("Failed to move these files:")
-                    for failed_path, reason in move_failures:
-                        try:
-                            display_path = str(failed_path.relative_to(base_path))
-                        except ValueError:
-                            display_path = str(failed_path)
-                        print(f"- {display_path} | reason={reason}")
-
+        if args.include_probable:
+            print("No merged/probable merged files found to unmerge.")
+        else:
+            print("No high-confidence merged files found to unmerge.")
         return
+
+    delete_originals = prompt_delete_originals()
+
+    unmerged_folder = base_path.parent / f"{base_path.name}_unmerged"
+    unmerged_folder.mkdir(parents=True, exist_ok=True)
+
+    processed_files, failed_files, total_created = execute_unmerge_candidates(
+        unmerge_candidates,
+        unmerged_folder,
+    )
+
+    trashed_failures: List[Path] = []
+    if delete_originals and processed_files:
+        trashed_failures = send_paths_to_trash(processed_files)
 
     moved_files: List[Path] = []
     move_failures: List[Tuple[Path, str]] = []
-    if move_target is not None and detected_merged_paths:
-        moved_files, move_failures = move_paths_to_folder(detected_merged_paths, move_target)
+    if move_target is not None and not delete_originals:
+        move_candidates = [path for path in merged_files if path.exists()]
+        moved_files, move_failures = move_paths_to_folder(move_candidates, move_target)
+
+    unmerge_report = build_unmerge_report(
+        unmerged_folder,
+        merged_files,
+        processed_files,
+        failed_files,
+        total_created,
+        delete_originals,
+        trashed_failures,
+        move_target,
+        moved_files,
+        move_failures,
+    )
 
     if args.json:
-        payload: Dict[str, object] = {"findings": findings, "stats": stats}
-        if move_target is not None:
-            payload["move"] = {
-                "target": str(move_target),
-                "moved": len(moved_files),
-                "failed": len(move_failures),
-                "failed_details": [
-                    {"path": str(path), "reason": reason} for path, reason in move_failures
-                ],
-            }
-        print(json.dumps(payload, indent=2))
+        emit_unmerge_json(
+            findings,
+            stats,
+            unmerge_report,
+            failed_files,
+            trashed_failures,
+            move_failures,
+        )
         return
 
+    print_unmerge_text_summary(
+        base_path,
+        unmerge_report,
+        failed_files,
+        delete_originals,
+        processed_files,
+        trashed_failures,
+        move_target,
+        moved_files,
+        move_failures,
+    )
+
+
+def emit_findings_json(
+    findings: List[Dict[str, object]],
+    stats: Dict[str, int],
+    move_target: Optional[Path],
+    moved_files: List[Path],
+    move_failures: List[Tuple[Path, str]],
+) -> None:
+    payload: Dict[str, object] = {"findings": findings, "stats": stats}
+    if move_target is not None:
+        payload["move"] = {
+            "target": str(move_target),
+            "moved": len(moved_files),
+            "failed": len(move_failures),
+            "failed_details": [
+                {"path": str(path), "reason": reason} for path, reason in move_failures
+            ],
+        }
+    print(json.dumps(payload, indent=2))
+
+
+def print_findings_text(
+    args: argparse.Namespace,
+    base_path: Path,
+    stats: Dict[str, int],
+    findings: List[Dict[str, object]],
+    move_target: Optional[Path],
+    moved_files: List[Path],
+    move_failures: List[Tuple[Path, str]],
+) -> None:
     print(f"Scanning path: {base_path}")
     print(f"Scanned .package files: {stats['total']}")
     print(f"High-confidence merged: {stats['merged_high']}")
@@ -1226,25 +1481,46 @@ def main() -> None:
         print(f"Merged files moved: {len(moved_files)} -> {move_target}")
         if move_failures:
             print("Failed to move these files:")
-            for failed_path, reason in move_failures:
-                try:
-                    display_path = str(failed_path.relative_to(base_path))
-                except ValueError:
-                    display_path = str(failed_path)
-                print(f"- {display_path} | reason={reason}")
+            print_path_reason_lines(base_path, move_failures)
 
     print("\nDetected merged packages:")
     for finding in findings:
         file_path = Path(str(finding["path"]))
-        try:
-            display_path = str(file_path.relative_to(base_path))
-        except ValueError:
-            display_path = str(file_path)
-
+        display_path = format_relative_path(base_path, file_path)
         print(
             f"- {display_path} | status={finding['status']} | confidence={finding['confidence']} | "
             f"reason={finding['reason']}"
         )
+
+
+def main() -> None:
+    args = parse_args()
+    base_path = get_selected_scan_path(args)
+
+    findings, stats = analyze_folder(
+        base_path,
+        include_probable=args.include_probable,
+        min_casparts_primary=args.min_casparts_primary,
+        min_casparts_secondary=args.min_casparts_secondary,
+        min_caspart_density=args.min_caspart_density,
+    )
+
+    detected_merged_paths = finding_paths(findings, {"Merged", "ProbablyMerged"})
+    move_target = get_move_target(args.move_path)
+
+    if args.unmerge:
+        handle_unmerge_mode(args, base_path, findings, stats, move_target)
+        return
+
+    moved_files: List[Path] = []
+    move_failures: List[Tuple[Path, str]] = []
+    if move_target is not None and detected_merged_paths:
+        moved_files, move_failures = move_paths_to_folder(detected_merged_paths, move_target)
+
+    if args.json:
+        emit_findings_json(findings, stats, move_target, moved_files, move_failures)
+        return
+    print_findings_text(args, base_path, stats, findings, move_target, moved_files, move_failures)
 
 
 if __name__ == "__main__":

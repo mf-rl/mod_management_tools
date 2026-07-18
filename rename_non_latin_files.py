@@ -8,6 +8,8 @@ try:
 except ImportError:  # pragma: no cover
     unidecode = None
 
+MAX_FILENAME_LENGTH = 255
+
 
 def transliterate_character(character: str) -> str:
     if character.isascii():
@@ -28,7 +30,20 @@ def transliterate_character(character: str) -> str:
     if replacement:
         return replacement
 
-    return str(ord(character))
+    return ""
+
+
+def truncate_filename(name: str, max_length: int = MAX_FILENAME_LENGTH) -> str:
+    if len(name) <= max_length:
+        return name
+
+    path_name = Path(name)
+    suffix = path_name.suffix
+    stem_length = max_length - len(suffix)
+    if stem_length <= 0:
+        return name[:max_length]
+
+    return f"{path_name.stem[:stem_length]}{suffix}"
 
 
 def normalize_filename(name: str) -> Tuple[str, bool]:
@@ -43,7 +58,7 @@ def normalize_filename(name: str) -> Tuple[str, bool]:
         normalized_parts.append(transliterate_character(character))
         changed = True
 
-    normalized_name = "".join(normalized_parts)
+    normalized_name = truncate_filename("".join(normalized_parts))
     if not normalized_name:
         normalized_name = "file"
 
@@ -63,7 +78,11 @@ def build_unique_target(original_path: Path, candidate_name: str) -> Path:
     counter = 1
 
     while True:
-        numbered_candidate = original_path.with_name(f"{stem}_{counter}{suffix}")
+        counter_suffix = f"_{counter}"
+        numbered_stem = stem[: MAX_FILENAME_LENGTH - len(suffix) - len(counter_suffix)]
+        numbered_candidate = original_path.with_name(
+            f"{numbered_stem}{counter_suffix}{suffix}"
+        )
         if numbered_candidate == original_path:
             counter += 1
             continue
@@ -97,7 +116,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
             "Scan a folder recursively and rename files that contain non-ASCII characters "
-            "to Latin equivalents (or character code numbers when no equivalent exists)."
+            "to Latin equivalents, removing characters with no equivalent."
         )
     )
     parser.add_argument("path", help="Path to scan")

@@ -77,7 +77,18 @@ Reconstructs individual `.package` files from a merged DBPF:
 - Maps resources by TGI key with swapped-instance fallback.
 - Builds valid DBPF files for each extracted package.
 - For empty-manifest merges: splits by CASP instance ID + writes a shared resources package.
+- Writes extracted packages into a dedicated subfolder per merged file, named after the merged filename stem.
 - Interactive prompt to keep or trash original merged files.
+
+Example output for merged inputs `merged1.package` and `merged2.package`:
+
+```text
+<scan_path>_unmerged/
+	merged1/
+		...extracted .package files from merged1.package...
+	merged2/
+		...extracted .package files from merged2.package...
+```
 
 #### Usage
 

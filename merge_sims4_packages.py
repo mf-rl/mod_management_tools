@@ -449,7 +449,7 @@ def _send_path_to_trash_windows(path: Path) -> bool:
         _fields_ = [
             ("hwnd", ctypes.c_void_p),
             ("wFunc", ctypes.c_uint),
-            ("pFrom", ctypes.c_wchar_p),
+            ("pFrom", ctypes.c_void_p),
             ("pTo", ctypes.c_wchar_p),
             ("fFlags", ctypes.c_ushort),
             ("fAnyOperationsAborted", ctypes.c_bool),
@@ -465,7 +465,8 @@ def _send_path_to_trash_windows(path: Path) -> bool:
 
     operation = SHFILEOPSTRUCTW()
     operation.wFunc = FO_DELETE
-    operation.pFrom = f"{str(path)}\0\0"
+    from_buffer = ctypes.create_unicode_buffer(f"{str(path)}\0\0")
+    operation.pFrom = ctypes.cast(from_buffer, ctypes.c_void_p).value
     operation.fFlags = FOF_ALLOWUNDO | FOF_NOCONFIRMATION | FOF_NOERRORUI | FOF_SILENT
 
     result = ctypes.windll.shell32.SHFileOperationW(ctypes.byref(operation))
@@ -481,7 +482,7 @@ def _send_paths_to_trash_windows_batched(paths: List[Path], chunk_size: int = 20
         _fields_ = [
             ("hwnd", ctypes.c_void_p),
             ("wFunc", ctypes.c_uint),
-            ("pFrom", ctypes.c_wchar_p),
+            ("pFrom", ctypes.c_void_p),
             ("pTo", ctypes.c_wchar_p),
             ("fFlags", ctypes.c_ushort),
             ("fAnyOperationsAborted", ctypes.c_bool),
@@ -501,7 +502,10 @@ def _send_paths_to_trash_windows_batched(paths: List[Path], chunk_size: int = 20
         chunk = paths[index : index + chunk_size]
         operation = SHFILEOPSTRUCTW()
         operation.wFunc = FO_DELETE
-        operation.pFrom = "\0".join(str(path) for path in chunk) + "\0\0"
+        from_buffer = ctypes.create_unicode_buffer(
+            "\0".join(str(path) for path in chunk) + "\0\0"
+        )
+        operation.pFrom = ctypes.cast(from_buffer, ctypes.c_void_p).value
         operation.fFlags = FOF_ALLOWUNDO | FOF_NOCONFIRMATION | FOF_NOERRORUI | FOF_SILENT
 
         result = ctypes.windll.shell32.SHFileOperationW(ctypes.byref(operation))
